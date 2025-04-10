@@ -143,3 +143,19 @@ The evaluation will be based on the following criteria:
 * **Code Quality:** Clarity, efficiency, and documentation of the code.
 * **Methodology:** Soundness of the approach, including data preprocessing, feature engineering, model selection, and evaluation.
 * **Report Quality:** Clarity and completeness of the report.
+
+----
+
+# Project structure:
+
+```bash
+Fall-Detection-Exercise/
+├── data/               # Directory for dataset
+├── scripts/
+│   ├── preprocess.py   # Data loading and preprocessing
+│   ├── train.py        # Model training
+│   └── evaluate.py     # Model evaluation
+├── models/             # Saved model weights
+├── requirements.txt    # Project dependencies
+└── README.md          # Project documentation
+```
