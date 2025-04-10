@@ -57,6 +57,11 @@ def create_sequences(X, y, seq_length=100):
     for i in range(len(X) - seq_length):
         sequences.append(X[i:i+seq_length])
         labels.append(y[i+seq_length-1])
+    
+    # Convert lists to numpy arrays before creating tensors
+    sequences = np.array(sequences)
+    labels = np.array(labels)
+    
     logger.info(f"Created {len(sequences)} sequences")
     return torch.tensor(sequences).float(), torch.tensor(labels).float()
 

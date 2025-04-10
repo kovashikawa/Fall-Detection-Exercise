@@ -5,7 +5,8 @@ from datetime import datetime
 def setup_logger(name, log_file=None, level=logging.INFO):
     """Setup a logger with both file and console handlers."""
     # Create logger
-    logger = logging.getLogger(name)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    logger = logging.getLogger(f"{name}_{timestamp}")
     logger.setLevel(level)
     
     # Create formatters
@@ -38,4 +39,4 @@ def setup_logger(name, log_file=None, level=logging.INFO):
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
     
-    return logger 
+    return logger
