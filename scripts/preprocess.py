@@ -7,6 +7,7 @@ import torch
 from logger_config import setup_logger
 import random
 from sklearn.preprocessing import StandardScaler
+import argparse
 
 # Setup logger
 logger = setup_logger('preprocess', 'preprocessing')
@@ -130,7 +131,15 @@ def load_subject_data(subject_path):
     
     return subject_data
 
-def load_all_subjects(data_dir):
+def parse_args():
+    p = argparse.ArgumentParser(description="Fall-Detection preprocessing")
+    p.add_argument('--sample_frac', type=float, default=1.0,
+                   help="If <1.0, only keep this fraction of rows after loading for quick debug")
+    p.add_argument('--data_dir', type=str, default='data',
+                   help="Directory containing the data files")
+    return p.parse_args()
+
+def load_all_subjects(data_dir, sample_frac=1.0):
     """Load and combine data from all subjects"""
     logger.info("Loading data from all subjects")
     all_data = []
@@ -141,6 +150,12 @@ def load_all_subjects(data_dir):
     if not subject_dirs:
         logger.warning(f"No subject directories found in {data_dir}. Generating sample data...")
         return generate_sample_data()
+    
+    # If sample_frac < 1.0, only process a subset of subjects
+    if sample_frac < 1.0:
+        n_keep = max(1, int(len(subject_dirs) * sample_frac))
+        subject_dirs = subject_dirs[:n_keep]
+        logger.info(f"[DEBUG] Only processing {n_keep} subjects for quick turn-around")
     
     for subject_dir in subject_dirs:
         subject_path = os.path.join(data_dir, subject_dir)
@@ -154,6 +169,12 @@ def load_all_subjects(data_dir):
     
     # Combine all data
     combined_data = pd.concat(all_data, ignore_index=True)
+    
+    # If sample_frac < 1.0, further subsample the combined data
+    if sample_frac < 1.0:
+        combined_data = combined_data.sample(frac=sample_frac, random_state=42).reset_index(drop=True)
+        logger.info(f"[DEBUG] Sampled down to {len(combined_data)} rows ({sample_frac*100:.1f}% of original)")
+    
     logger.info(f"Loaded data from {len(subject_dirs)} subjects with {len(all_data)} trials")
     logger.info(f"Total data shape: {combined_data.shape}")
     
@@ -268,7 +289,7 @@ def create_sequences(X, y, seq_length=100, stride=50):
     logger.info(f"Created {len(sequences)} sequences")
     return sequences, labels
 
-def preprocess_data(data_dir, seq_length=100, stride=50):
+def preprocess_data(data_dir, seq_length=100, stride=50, sample_frac=1.0):
     """Main preprocessing function."""
     logger.info("Starting data preprocessing")
     
@@ -277,7 +298,7 @@ def preprocess_data(data_dir, seq_length=100, stride=50):
     
     # Load data
     logger.info("Loading data")
-    data = load_all_subjects(data_dir)
+    data = load_all_subjects(data_dir, sample_frac)
     logger.info(f"Loaded data shape: {data.shape}")
     
     # Handle missing values
@@ -337,10 +358,11 @@ def preprocess_data(data_dir, seq_length=100, stride=50):
 
 if __name__ == '__main__':
     try:
-        # Example usage
-        data_dir = 'data'
-        logger.info(f"Starting preprocessing with data directory: {data_dir}")
-        processed_data = preprocess_data(data_dir)
+        args = parse_args()
+        logger.info(f"Starting preprocessing with data directory: {args.data_dir}")
+        logger.info(f"Sample fraction: {args.sample_frac}")
+        
+        processed_data = preprocess_data(args.data_dir, sample_frac=args.sample_frac)
         logger.info(f"Training data shape: {processed_data['train'][0].shape}")
         logger.info(f"Validation data shape: {processed_data['val'][0].shape}")
         logger.info(f"Test data shape: {processed_data['test'][0].shape}")
