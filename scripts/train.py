@@ -2,21 +2,18 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
-from preprocess import preprocess_data
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import os
+from datetime import datetime
 from logger_config import setup_logger
+from preprocess import preprocess_data
 from model_comparison import ModelComparison
 from sklearn.model_selection import KFold
-import numpy as np
-from datetime import datetime
-import os
 import pandas as pd
 
-# Setup logger with timestamp
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-logger = setup_logger('train', f'training_{timestamp}')
+# Setup logger
+logger = setup_logger('train', 'training')
 
 def load_all_subjects(data_dir):
     """Load and combine data from all subjects with proper activity labels"""
@@ -105,54 +102,61 @@ def create_sliding_sequences(X, y, window_size=100, stride=50):
     return np.array(sequences), np.array(labels)
 
 class AttentionBiLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=1):
+    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2):
         super(AttentionBiLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
-                           batch_first=True, bidirectional=True)
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # Bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
         )
-        self.fc = nn.Linear(hidden_dim * 2, output_dim)
-        self.sigmoid = nn.Sigmoid()
-
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        
+        # Regression head for severity
+        self.regressor = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1)
+        )
+    
     def forward(self, x):
+        # LSTM forward pass
         lstm_out, _ = self.lstm(x)
         
-        # Compute attention weights
+        # Attention weights
         attention_weights = self.attention(lstm_out)
         attention_weights = torch.softmax(attention_weights, dim=1)
         
         # Apply attention
-        attended = torch.sum(attention_weights * lstm_out, dim=1)
+        context = torch.sum(attention_weights * lstm_out, dim=1)
         
-        out = self.fc(attended)
-        return self.sigmoid(out)
-
-class FallSeverityRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers):
-        super(FallSeverityRegressor, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
-                           batch_first=True, bidirectional=True)
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        attention_weights = self.attention(lstm_out)
-        attention_weights = torch.softmax(attention_weights, dim=1)
-        attended = torch.sum(attention_weights * lstm_out, dim=1)
-        return self.fc(attended)
+        # Classification and regression outputs
+        classification = self.classifier(context)
+        severity = self.regressor(context)
+        
+        return classification, severity
 
 class EarlyStopping:
     def __init__(self, patience=5, min_delta=0):
@@ -161,7 +165,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
-
+    
     def __call__(self, val_loss):
         if self.best_loss is None:
             self.best_loss = val_loss
@@ -175,132 +179,201 @@ class EarlyStopping:
 
 def compute_severity_score(data):
     """Compute fall severity score based on acceleration and impact features"""
-    # Calculate impact force (using acceleration magnitude)
-    acc_magnitude = np.sqrt(np.sum(data[['acc_x', 'acc_y', 'acc_z']]**2, axis=1))
-    impact_force = np.max(acc_magnitude)
+    # Get acceleration columns for all sensors
+    acc_cols = [col for col in data.columns if 'Acceleration' in col]
+    
+    # Calculate total acceleration magnitude for each sensor
+    acc_magnitudes = []
+    for i in range(0, len(acc_cols), 3):  # Process X, Y, Z components together
+        acc_x = data[acc_cols[i]].astype(float)
+        acc_y = data[acc_cols[i+1]].astype(float)
+        acc_z = data[acc_cols[i+2]].astype(float)
+        magnitude = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+        acc_magnitudes.append(magnitude)
+    
+    # Combine magnitudes from all sensors
+    total_acc_magnitude = np.mean(acc_magnitudes, axis=0)
+    
+    # Calculate impact force (using maximum acceleration magnitude)
+    impact_force = np.max(total_acc_magnitude)
     
     # Calculate duration of high acceleration
-    high_acc_threshold = np.percentile(acc_magnitude, 95)
-    duration = np.sum(acc_magnitude > high_acc_threshold)
+    high_acc_threshold = np.percentile(total_acc_magnitude, 95)
+    duration = np.sum(total_acc_magnitude > high_acc_threshold)
     
-    # Calculate additional severity features
-    jerk_magnitude = np.sqrt(np.sum(data[['acc_x_jerk', 'acc_y_jerk', 'acc_z_jerk']]**2, axis=1))
-    max_jerk = np.max(jerk_magnitude)
+    # Get angular velocity columns for all sensors
+    gyro_cols = [col for col in data.columns if 'Angular Velocity' in col]
+    
+    # Calculate total angular velocity magnitude for each sensor
+    gyro_magnitudes = []
+    for i in range(0, len(gyro_cols), 3):  # Process X, Y, Z components together
+        gyro_x = data[gyro_cols[i]].astype(float)
+        gyro_y = data[gyro_cols[i+1]].astype(float)
+        gyro_z = data[gyro_cols[i+2]].astype(float)
+        magnitude = np.sqrt(gyro_x**2 + gyro_y**2 + gyro_z**2)
+        gyro_magnitudes.append(magnitude)
+    
+    # Combine magnitudes from all sensors
+    total_gyro_magnitude = np.mean(gyro_magnitudes, axis=0)
+    max_angular_velocity = np.max(total_gyro_magnitude)
     
     # Combine into severity score (normalized between 0 and 1)
-    severity = (0.6 * impact_force + 0.3 * duration + 0.1 * max_jerk) / \
-              (np.max(acc_magnitude) * len(data))
-    return severity
+    severity = (0.5 * impact_force + 0.3 * duration + 0.2 * max_angular_velocity) / \
+              (np.max([impact_force, 1]) * len(data))
+    
+    return float(severity)
 
-def train_epoch(models, train_loader, criteria, optimizers, device, metrics_history):
-    classifier, regressor = models
-    clf_criterion, reg_criterion = criteria
-    clf_optimizer, reg_optimizer = optimizers
+def train_epoch(model, train_loader, criterion_cls, criterion_reg, optimizer, device):
+    model.train()
+    total_loss = 0
+    total_cls_loss = 0
+    total_reg_loss = 0
     
-    classifier.train()
-    regressor.train()
-    
-    clf_total_loss = 0
-    reg_total_loss = 0
-    clf_correct = 0
-    total = 0
-    total_severity = 0
-    
-    for x_batch, y_batch, severity_batch in train_loader:
-        x_batch, y_batch, severity_batch = x_batch.to(device), y_batch.to(device), severity_batch.to(device)
+    for batch_X, batch_y, batch_severity in train_loader:
+        batch_X = batch_X.to(device)
+        batch_y = batch_y.to(device)
+        batch_severity = batch_severity.to(device)
         
-        # Train classifier
-        clf_optimizer.zero_grad()
-        clf_outputs = classifier(x_batch)
-        clf_loss = clf_criterion(clf_outputs, y_batch)
-        clf_loss.backward()
-        clf_optimizer.step()
+        optimizer.zero_grad()
         
-        # Train regressor
-        reg_optimizer.zero_grad()
-        reg_outputs = regressor(x_batch)
-        reg_loss = reg_criterion(reg_outputs, severity_batch)
-        reg_loss.backward()
-        reg_optimizer.step()
+        # Forward pass
+        pred_cls, pred_severity = model(batch_X)
         
-        clf_total_loss += clf_loss.item()
-        reg_total_loss += reg_loss.item()
-        predicted = (clf_outputs > 0.5).float()
-        total += y_batch.size(0)
-        clf_correct += (predicted == y_batch).sum().item()
-        total_severity += torch.mean(torch.abs(reg_outputs - severity_batch)).item()
+        # Compute losses
+        cls_loss = criterion_cls(pred_cls, batch_y.unsqueeze(1))
+        reg_loss = criterion_reg(pred_severity, batch_severity.unsqueeze(1))
+        loss = cls_loss + reg_loss
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        total_cls_loss += cls_loss.item()
+        total_reg_loss += reg_loss.item()
     
-    avg_clf_loss = clf_total_loss / len(train_loader)
-    avg_reg_loss = reg_total_loss / len(train_loader)
-    accuracy = clf_correct / total
-    avg_severity = total_severity / len(train_loader)
-    
-    # Update metrics history
-    metrics_history['clf_train_loss'].append(avg_clf_loss)
-    metrics_history['reg_train_loss'].append(avg_reg_loss)
-    metrics_history['train_acc'].append(accuracy)
-    metrics_history['train_severity'].append(avg_severity)
-    
-    return avg_clf_loss, avg_reg_loss, accuracy
+    return total_loss / len(train_loader), total_cls_loss / len(train_loader), total_reg_loss / len(train_loader)
 
-def validate_epoch(models, val_loader, criteria, device, metrics_history):
-    classifier, regressor = models
-    clf_criterion, reg_criterion = criteria
-    
-    classifier.eval()
-    regressor.eval()
-    
-    clf_total_loss = 0
-    reg_total_loss = 0
-    clf_correct = 0
-    total = 0
-    total_severity = 0
+def validate(model, val_loader, criterion_cls, criterion_reg, device):
+    model.eval()
+    total_loss = 0
+    total_cls_loss = 0
+    total_reg_loss = 0
+    all_preds = []
+    all_labels = []
+    all_severity = []
+    all_pred_severity = []
     
     with torch.no_grad():
-        for x_batch, y_batch, severity_batch in val_loader:
-            x_batch, y_batch, severity_batch = x_batch.to(device), y_batch.to(device), severity_batch.to(device)
+        for batch_X, batch_y, batch_severity in val_loader:
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+            batch_severity = batch_severity.to(device)
             
-            clf_outputs = classifier(x_batch)
-            reg_outputs = regressor(x_batch)
+            # Forward pass
+            pred_cls, pred_severity = model(batch_X)
             
-            clf_loss = clf_criterion(clf_outputs, y_batch)
-            reg_loss = reg_criterion(reg_outputs, severity_batch)
+            # Compute losses
+            cls_loss = criterion_cls(pred_cls, batch_y.unsqueeze(1))
+            reg_loss = criterion_reg(pred_severity, batch_severity.unsqueeze(1))
+            loss = cls_loss + reg_loss
             
-            clf_total_loss += clf_loss.item()
-            reg_total_loss += reg_loss.item()
-            predicted = (clf_outputs > 0.5).float()
-            total += y_batch.size(0)
-            clf_correct += (predicted == y_batch).sum().item()
-            total_severity += torch.mean(torch.abs(reg_outputs - severity_batch)).item()
+            total_loss += loss.item()
+            total_cls_loss += cls_loss.item()
+            total_reg_loss += reg_loss.item()
+            
+            # Store predictions
+            all_preds.extend((pred_cls > 0.5).float().cpu().numpy())
+            all_labels.extend(batch_y.cpu().numpy())
+            all_severity.extend(batch_severity.cpu().numpy())
+            all_pred_severity.extend(pred_severity.cpu().numpy())
     
-    avg_clf_loss = clf_total_loss / len(val_loader)
-    avg_reg_loss = reg_total_loss / len(val_loader)
-    accuracy = clf_correct / total
-    avg_severity = total_severity / len(val_loader)
+    # Calculate metrics
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_severity = np.array(all_severity)
+    all_pred_severity = np.array(all_pred_severity)
     
-    # Update metrics history
-    metrics_history['clf_val_loss'].append(avg_clf_loss)
-    metrics_history['reg_val_loss'].append(avg_reg_loss)
-    metrics_history['val_acc'].append(accuracy)
-    metrics_history['val_severity'].append(avg_severity)
+    metrics = {
+        'loss': total_loss / len(val_loader),
+        'cls_loss': total_cls_loss / len(val_loader),
+        'reg_loss': total_reg_loss / len(val_loader),
+        'accuracy': accuracy_score(all_labels, all_preds),
+        'precision': precision_score(all_labels, all_preds),
+        'recall': recall_score(all_labels, all_preds),
+        'f1': f1_score(all_labels, all_preds),
+        'severity_mse': np.mean((all_severity - all_pred_severity) ** 2)
+    }
     
-    return avg_clf_loss, avg_reg_loss, accuracy
+    return metrics
 
-def get_feature_columns(data):
-    """Get feature columns from the data"""
-    # Exclude non-feature columns
-    exclude_cols = ['subject', 'trial', 'label', 'timestamp']
-    feature_cols = [col for col in data.columns if col not in exclude_cols]
-    return feature_cols
+def train_model(model, train_loader, val_loader, criterion_cls, criterion_reg, optimizer, 
+                scheduler, early_stopping, device, num_epochs=100):
+    best_val_loss = float('inf')
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_cls_loss': [],
+        'val_cls_loss': [],
+        'train_reg_loss': [],
+        'val_reg_loss': [],
+        'val_accuracy': [],
+        'val_precision': [],
+        'val_recall': [],
+        'val_f1': [],
+        'val_severity_mse': []
+    }
+    
+    for epoch in range(num_epochs):
+        # Training
+        train_loss, train_cls_loss, train_reg_loss = train_epoch(
+            model, train_loader, criterion_cls, criterion_reg, optimizer, device
+        )
+        
+        # Validation
+        val_metrics = validate(model, val_loader, criterion_cls, criterion_reg, device)
+        
+        # Update learning rate
+        scheduler.step(val_metrics['loss'])
+        
+        # Early stopping check
+        early_stopping(val_metrics['loss'])
+        if early_stopping.early_stop:
+            logger.info(f"Early stopping at epoch {epoch}")
+            break
+        
+        # Save best model
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            torch.save(model.state_dict(), f'models/classifier_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth')
+        
+        # Update history
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_metrics['loss'])
+        history['train_cls_loss'].append(train_cls_loss)
+        history['val_cls_loss'].append(val_metrics['cls_loss'])
+        history['train_reg_loss'].append(train_reg_loss)
+        history['val_reg_loss'].append(val_metrics['reg_loss'])
+        history['val_accuracy'].append(val_metrics['accuracy'])
+        history['val_precision'].append(val_metrics['precision'])
+        history['val_recall'].append(val_metrics['recall'])
+        history['val_f1'].append(val_metrics['f1'])
+        history['val_severity_mse'].append(val_metrics['severity_mse'])
+        
+        # Log progress
+        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+        logger.info(f"Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, Reg: {train_reg_loss:.4f})")
+        logger.info(f"Val Loss: {val_metrics['loss']:.4f} (Cls: {val_metrics['cls_loss']:.4f}, Reg: {val_metrics['reg_loss']:.4f})")
+        logger.info(f"Val Metrics - Acc: {val_metrics['accuracy']:.4f}, Prec: {val_metrics['precision']:.4f}, "
+                   f"Rec: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}")
+        logger.info(f"Val Severity MSE: {val_metrics['severity_mse']:.4f}")
+    
+    return history
 
 def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[50, 100, 150]):
     logger.info(f"Starting cross-validation with {n_splits} splits")
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     best_metrics = {}
-    
-    # Get feature columns
-    features = get_feature_columns(data)
-    logger.info(f"Using {len(features)} features: {features}")
     
     for seq_length in seq_lengths:
         logger.info(f"Testing sequence length: {seq_length}")
@@ -313,17 +386,32 @@ def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[
             train_data = data.iloc[train_idx]
             val_data = data.iloc[val_idx]
             
-            # Create sequences and compute severity scores
-            X_train, y_train = create_sliding_sequences(
-                train_data[features].values, 
-                train_data['label'].values,
+            # Ensure all feature data is numeric and handle any missing values
+            X_train = train_data[['Acceleration_X', 'Acceleration_Y', 'Acceleration_Z', 'Angular_Velocity_X', 'Angular_Velocity_Y', 'Angular_Velocity_Z']].astype(float).fillna(0)
+            y_train = train_data['label'].astype(float).values
+            X_val = val_data[['Acceleration_X', 'Acceleration_Y', 'Acceleration_Z', 'Angular_Velocity_X', 'Angular_Velocity_Y', 'Angular_Velocity_Z']].astype(float).fillna(0)
+            y_val = val_data['label'].astype(float).values
+            
+            # Create sequences
+            X_train_seq, y_train_seq = create_sliding_sequences(
+                X_train.values, 
+                y_train,
                 window_size=seq_length,
                 stride=seq_length//2
             )
             
-            # Convert to PyTorch tensors and move to device
-            X_train = torch.FloatTensor(X_train).to(device)
-            y_train = torch.FloatTensor(y_train).unsqueeze(1).to(device)
+            X_val_seq, y_val_seq = create_sliding_sequences(
+                X_val.values,
+                y_val,
+                window_size=seq_length,
+                stride=seq_length//2
+            )
+            
+            # Convert to PyTorch tensors
+            X_train_tensor = torch.FloatTensor(X_train_seq).to(device)
+            y_train_tensor = torch.FloatTensor(y_train_seq).unsqueeze(1).to(device)
+            X_val_tensor = torch.FloatTensor(X_val_seq).to(device)
+            y_val_tensor = torch.FloatTensor(y_val_seq).unsqueeze(1).to(device)
             
             # Compute severity scores
             severity_train = []
@@ -331,108 +419,46 @@ def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[
                 window_data = train_data.iloc[i:i+seq_length]
                 severity = compute_severity_score(window_data)
                 severity_train.append(severity)
-            severity_train = torch.FloatTensor(severity_train).unsqueeze(1).to(device)
+            severity_train_tensor = torch.FloatTensor(severity_train).unsqueeze(1).to(device)
             
-            # Create validation tensors
-            X_val, y_val = create_sliding_sequences(
-                val_data[features].values,
-                val_data['label'].values,
-                window_size=seq_length,
-                stride=seq_length//2
-            )
-            X_val = torch.FloatTensor(X_val).to(device)
-            y_val = torch.FloatTensor(y_val).unsqueeze(1).to(device)
-            
-            # Compute validation severity scores
             severity_val = []
             for i in range(0, len(val_data)-seq_length+1, seq_length//2):
                 window_data = val_data.iloc[i:i+seq_length]
                 severity = compute_severity_score(window_data)
                 severity_val.append(severity)
-            severity_val = torch.FloatTensor(severity_val).unsqueeze(1).to(device)
+            severity_val_tensor = torch.FloatTensor(severity_val).unsqueeze(1).to(device)
             
             # Create data loaders
-            train_dataset = TensorDataset(X_train, y_train, severity_train)
-            val_dataset = TensorDataset(X_val, y_val, severity_val)
+            train_dataset = TensorDataset(X_train_tensor, y_train_tensor, severity_train_tensor)
+            val_dataset = TensorDataset(X_val_tensor, y_val_tensor, severity_val_tensor)
             train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=64)
             
-            # Initialize models
-            classifier = AttentionBiLSTM(
-                input_dim=X_train.shape[2],
-                hidden_dim=64,
-                num_layers=2
-            ).to(device)
+            # Initialize model
+            input_size = X_train_tensor.shape[2]  # Number of features
+            model = AttentionBiLSTM(input_size=input_size, hidden_size=64).to(device)
             
-            regressor = FallSeverityRegressor(
-                input_dim=X_train.shape[2],
-                hidden_dim=64,
-                num_layers=2
-            ).to(device)
-            
-            clf_criterion = nn.BCELoss()
-            reg_criterion = nn.MSELoss()
-            
-            clf_optimizer = optim.Adam(classifier.parameters(), lr=0.001)
-            reg_optimizer = optim.Adam(regressor.parameters(), lr=0.001)
-            
-            clf_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                clf_optimizer, mode='min', factor=0.1, patience=3, verbose=True
-            )
-            reg_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                reg_optimizer, mode='min', factor=0.1, patience=3, verbose=True
-            )
-            
+            # Initialize loss functions and optimizer
+            criterion_cls = nn.BCELoss()
+            criterion_reg = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
             early_stopping = EarlyStopping(patience=5)
             
-            # Training loop
-            clf_train_losses = []
-            reg_train_losses = []
-            clf_val_losses = []
-            reg_val_losses = []
-            train_accs = []
-            val_accs = []
-            
-            for epoch in range(15):
-                clf_train_loss, reg_train_loss, train_acc = train_epoch(
-                    (classifier, regressor),
-                    train_loader,
-                    (clf_criterion, reg_criterion),
-                    (clf_optimizer, reg_optimizer),
-                    device,
-                    metrics_history
-                )
-                
-                clf_val_loss, reg_val_loss, val_acc = validate_epoch(
-                    (classifier, regressor),
-                    val_loader,
-                    (clf_criterion, reg_criterion),
-                    device,
-                    metrics_history
-                )
-                
-                clf_scheduler.step(clf_val_loss)
-                reg_scheduler.step(reg_val_loss)
-                early_stopping(clf_val_loss + reg_val_loss)
-                
-                clf_train_losses.append(clf_train_loss)
-                reg_train_losses.append(reg_train_loss)
-                clf_val_losses.append(clf_val_loss)
-                reg_val_losses.append(reg_val_loss)
-                train_accs.append(train_acc)
-                val_accs.append(val_acc)
-                
-                if early_stopping.early_stop:
-                    logger.info("Early stopping triggered")
-                    break
+            # Train model
+            logger.info("Starting training...")
+            history = train_model(
+                model, train_loader, val_loader, criterion_cls, criterion_reg,
+                optimizer, scheduler, early_stopping, device
+            )
             
             fold_metrics.append({
-                'clf_val_loss': min(clf_val_losses),
-                'reg_val_loss': min(reg_val_losses),
-                'val_acc': max(val_accs),
-                'clf_train_loss': min(clf_train_losses),
-                'reg_train_loss': min(reg_train_losses),
-                'train_acc': max(train_accs)
+                'clf_val_loss': history['val_loss'][-1],
+                'reg_val_loss': history['val_reg_loss'][-1],
+                'val_acc': history['val_accuracy'][-1],
+                'clf_train_loss': history['train_loss'][-1],
+                'reg_train_loss': history['train_reg_loss'][-1],
+                'train_acc': history['train_accuracy'][-1]
             })
         
         # Average metrics across folds
@@ -447,7 +473,7 @@ def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[
     
     return best_metrics, best_seq_length
 
-def main(metrics_history=None):
+def main():
     try:
         # Set device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -459,31 +485,22 @@ def main(metrics_history=None):
         data = load_all_subjects(data_dir)
         
         # Perform cross-validation
-        best_metrics, best_seq_length = cross_validate(data, device, metrics_history=metrics_history)
+        best_metrics, best_seq_length = cross_validate(data, device)
         logger.info(f"Best sequence length: {best_seq_length}")
         logger.info(f"Best metrics: {best_metrics}")
         
         # Train final models with best parameters
         logger.info("Training final models with best parameters")
         classifier = AttentionBiLSTM(
-            input_dim=63,
-            hidden_dim=64,
-            num_layers=2
-        ).to(device)
-        
-        regressor = FallSeverityRegressor(
-            input_dim=63,
-            hidden_dim=64,
-            num_layers=2
+            input_size=6,
+            hidden_size=64
         ).to(device)
         
         # Save models and results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         classifier_path = f'models/classifier_{timestamp}.pth'
-        regressor_path = f'models/regressor_{timestamp}.pth'
         
         torch.save(classifier.state_dict(), classifier_path)
-        torch.save(regressor.state_dict(), regressor_path)
         
         # Add to model comparison
         comparison = ModelComparison()
@@ -491,24 +508,11 @@ def main(metrics_history=None):
             'AttentionBiLSTM_Classifier',
             {k: v for k, v in best_metrics.items() if 'clf' in k or 'acc' in k},
             {
-                'input_dim': 63,
-                'hidden_dim': 64,
-                'num_layers': 2,
+                'input_size': 6,
+                'hidden_size': 64,
                 'sequence_length': best_seq_length
             },
             classifier_path
-        )
-        
-        comparison.add_model_result(
-            'FallSeverityRegressor',
-            {k: v for k, v in best_metrics.items() if 'reg' in k},
-            {
-                'input_dim': 63,
-                'hidden_dim': 64,
-                'num_layers': 2,
-                'sequence_length': best_seq_length
-            },
-            regressor_path
         )
         
         # Compare with previous models
