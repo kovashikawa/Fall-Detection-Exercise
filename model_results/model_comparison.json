@@ -1,0 +1,34 @@
+{
+    "AttentionBiLSTM_Classifier_20250418_181249": {
+        "model_name": "AttentionBiLSTM_Classifier",
+        "timestamp": "20250418_181249",
+        "metrics": {
+            "clf_val_loss": 0.5400683492422104,
+            "val_acc": 0.6,
+            "clf_train_loss": 0.6109448671340942,
+            "train_acc": 0.6666666666666666
+        },
+        "hyperparameters": {
+            "input_dim": 63,
+            "hidden_dim": 64,
+            "num_layers": 2,
+            "sequence_length": 150
+        },
+        "model_path": "models/classifier_20250418_181249.pth"
+    },
+    "FallSeverityRegressor_20250418_181249": {
+        "model_name": "FallSeverityRegressor",
+        "timestamp": "20250418_181249",
+        "metrics": {
+            "reg_val_loss": 7.67483196568719e-06,
+            "reg_train_loss": 0.0002722628752962919
+        },
+        "hyperparameters": {
+            "input_dim": 63,
+            "hidden_dim": 64,
+            "num_layers": 2,
+            "sequence_length": 150
+        },
+        "model_path": "models/regressor_20250418_181249.pth"
+    }
+}

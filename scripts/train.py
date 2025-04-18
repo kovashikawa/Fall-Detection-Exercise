@@ -11,10 +11,98 @@ from model_comparison import ModelComparison
 from sklearn.model_selection import KFold
 import numpy as np
 from datetime import datetime
+import os
+import pandas as pd
 
 # Setup logger with timestamp
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 logger = setup_logger('train', f'training_{timestamp}')
+
+def load_all_subjects(data_dir):
+    """Load and combine data from all subjects with proper activity labels"""
+    logger.info("Loading data from all subjects")
+    all_data = []
+    
+    # List all subject directories
+    subject_dirs = [d for d in os.listdir(data_dir) if d.startswith('sub') and os.path.isdir(os.path.join(data_dir, d))]
+    
+    if not subject_dirs:
+        logger.error(f"No subject directories found in {data_dir}")
+        raise ValueError("No data found. Please ensure the data directory contains subject folders (sub1, sub2, etc.)")
+    
+    for subject_dir in subject_dirs:
+        subject_path = os.path.join(data_dir, subject_dir)
+        logger.info(f"Processing subject: {subject_dir}")
+        
+        # Process each activity type (Falls, Near_Falls, ADLs)
+        activity_types = ['Falls', 'Near_Falls', 'ADLs']
+        
+        for activity_type in activity_types:
+            activity_path = os.path.join(subject_path, activity_type)
+            
+            if not os.path.exists(activity_path):
+                logger.warning(f"Activity directory not found: {activity_path}")
+                continue
+            
+            # List all Excel files in the activity directory
+            trial_files = [f for f in os.listdir(activity_path) if f.endswith('.xlsx')]
+            
+            if not trial_files:
+                logger.warning(f"No Excel files found in {activity_path}")
+                continue
+            
+            for trial_file in trial_files:
+                trial_path = os.path.join(activity_path, trial_file)
+                logger.info(f"Loading trial: {trial_file} from {activity_type}")
+                
+                try:
+                    # Read Excel data
+                    trial_data = pd.read_excel(trial_path)
+                    
+                    # Add metadata
+                    trial_data['subject'] = subject_dir
+                    trial_data['trial'] = trial_file.replace('.xlsx', '')
+                    trial_data['activity_type'] = activity_type
+                    
+                    # Extract fall type from filename (e.g., 'slip', 'trip', etc.)
+                    fall_type = trial_file.split('_')[1].lower()
+                    trial_data['fall_type'] = fall_type
+                    
+                    # Set binary label (1 for Falls, 0 for others)
+                    trial_data['label'] = 1 if activity_type == 'Falls' else 0
+                    
+                    all_data.append(trial_data)
+                except Exception as e:
+                    logger.error(f"Error loading {trial_path}: {str(e)}")
+                    continue
+    
+    if not all_data:
+        logger.error("No data was loaded from any subject")
+        raise ValueError("Failed to load any data. Please check the data directory structure and file formats.")
+    
+    # Combine all data
+    combined_data = pd.concat(all_data, ignore_index=True)
+    logger.info(f"Successfully loaded data from {len(subject_dirs)} subjects")
+    logger.info(f"Total data shape: {combined_data.shape}")
+    logger.info(f"Activity distribution:")
+    logger.info(combined_data.groupby('activity_type').size())
+    logger.info(f"Fall type distribution:")
+    logger.info(combined_data.groupby('fall_type').size())
+    logger.info(f"Label distribution:")
+    logger.info(combined_data['label'].value_counts())
+    
+    return combined_data
+
+def create_sliding_sequences(X, y, window_size=100, stride=50):
+    """Create sequences using sliding window approach"""
+    sequences = []
+    labels = []
+    
+    for i in range(0, len(X) - window_size + 1, stride):
+        sequences.append(X[i:i + window_size])
+        labels.append(y[i + window_size - 1])  # Use the label at the end of the window
+    
+    return np.array(sequences), np.array(labels)
 
 class AttentionBiLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim=1):
@@ -95,11 +183,16 @@ def compute_severity_score(data):
     high_acc_threshold = np.percentile(acc_magnitude, 95)
     duration = np.sum(acc_magnitude > high_acc_threshold)
     
+    # Calculate additional severity features
+    jerk_magnitude = np.sqrt(np.sum(data[['acc_x_jerk', 'acc_y_jerk', 'acc_z_jerk']]**2, axis=1))
+    max_jerk = np.max(jerk_magnitude)
+    
     # Combine into severity score (normalized between 0 and 1)
-    severity = (impact_force * duration) / (np.max(acc_magnitude) * len(data))
+    severity = (0.6 * impact_force + 0.3 * duration + 0.1 * max_jerk) / \
+              (np.max(acc_magnitude) * len(data))
     return severity
 
-def train_epoch(models, train_loader, criteria, optimizers, device):
+def train_epoch(models, train_loader, criteria, optimizers, device, metrics_history):
     classifier, regressor = models
     clf_criterion, reg_criterion = criteria
     clf_optimizer, reg_optimizer = optimizers
@@ -111,6 +204,7 @@ def train_epoch(models, train_loader, criteria, optimizers, device):
     reg_total_loss = 0
     clf_correct = 0
     total = 0
+    total_severity = 0
     
     for x_batch, y_batch, severity_batch in train_loader:
         x_batch, y_batch, severity_batch = x_batch.to(device), y_batch.to(device), severity_batch.to(device)
@@ -134,12 +228,22 @@ def train_epoch(models, train_loader, criteria, optimizers, device):
         predicted = (clf_outputs > 0.5).float()
         total += y_batch.size(0)
         clf_correct += (predicted == y_batch).sum().item()
+        total_severity += torch.mean(torch.abs(reg_outputs - severity_batch)).item()
     
-    return (clf_total_loss / len(train_loader), 
-            reg_total_loss / len(train_loader), 
-            clf_correct / total)
+    avg_clf_loss = clf_total_loss / len(train_loader)
+    avg_reg_loss = reg_total_loss / len(train_loader)
+    accuracy = clf_correct / total
+    avg_severity = total_severity / len(train_loader)
+    
+    # Update metrics history
+    metrics_history['clf_train_loss'].append(avg_clf_loss)
+    metrics_history['reg_train_loss'].append(avg_reg_loss)
+    metrics_history['train_acc'].append(accuracy)
+    metrics_history['train_severity'].append(avg_severity)
+    
+    return avg_clf_loss, avg_reg_loss, accuracy
 
-def validate_epoch(models, val_loader, criteria, device):
+def validate_epoch(models, val_loader, criteria, device, metrics_history):
     classifier, regressor = models
     clf_criterion, reg_criterion = criteria
     
@@ -150,6 +254,7 @@ def validate_epoch(models, val_loader, criteria, device):
     reg_total_loss = 0
     clf_correct = 0
     total = 0
+    total_severity = 0
     
     with torch.no_grad():
         for x_batch, y_batch, severity_batch in val_loader:
@@ -166,15 +271,36 @@ def validate_epoch(models, val_loader, criteria, device):
             predicted = (clf_outputs > 0.5).float()
             total += y_batch.size(0)
             clf_correct += (predicted == y_batch).sum().item()
+            total_severity += torch.mean(torch.abs(reg_outputs - severity_batch)).item()
     
-    return (clf_total_loss / len(val_loader),
-            reg_total_loss / len(val_loader),
-            clf_correct / total)
+    avg_clf_loss = clf_total_loss / len(val_loader)
+    avg_reg_loss = reg_total_loss / len(val_loader)
+    accuracy = clf_correct / total
+    avg_severity = total_severity / len(val_loader)
+    
+    # Update metrics history
+    metrics_history['clf_val_loss'].append(avg_clf_loss)
+    metrics_history['reg_val_loss'].append(avg_reg_loss)
+    metrics_history['val_acc'].append(accuracy)
+    metrics_history['val_severity'].append(avg_severity)
+    
+    return avg_clf_loss, avg_reg_loss, accuracy
 
-def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
+def get_feature_columns(data):
+    """Get feature columns from the data"""
+    # Exclude non-feature columns
+    exclude_cols = ['subject', 'trial', 'label', 'timestamp']
+    feature_cols = [col for col in data.columns if col not in exclude_cols]
+    return feature_cols
+
+def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[50, 100, 150]):
     logger.info(f"Starting cross-validation with {n_splits} splits")
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     best_metrics = {}
+    
+    # Get feature columns
+    features = get_feature_columns(data)
+    logger.info(f"Using {len(features)} features: {features}")
     
     for seq_length in seq_lengths:
         logger.info(f"Testing sequence length: {seq_length}")
@@ -194,21 +320,40 @@ def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
                 window_size=seq_length,
                 stride=seq_length//2
             )
-            severity_train = np.array([compute_severity_score(train_data.iloc[i:i+seq_length]) 
-                                     for i in range(0, len(train_data)-seq_length+1, seq_length//2)])
             
+            # Convert to PyTorch tensors and move to device
+            X_train = torch.FloatTensor(X_train).to(device)
+            y_train = torch.FloatTensor(y_train).unsqueeze(1).to(device)
+            
+            # Compute severity scores
+            severity_train = []
+            for i in range(0, len(train_data)-seq_length+1, seq_length//2):
+                window_data = train_data.iloc[i:i+seq_length]
+                severity = compute_severity_score(window_data)
+                severity_train.append(severity)
+            severity_train = torch.FloatTensor(severity_train).unsqueeze(1).to(device)
+            
+            # Create validation tensors
             X_val, y_val = create_sliding_sequences(
                 val_data[features].values,
                 val_data['label'].values,
                 window_size=seq_length,
                 stride=seq_length//2
             )
-            severity_val = np.array([compute_severity_score(val_data.iloc[i:i+seq_length]) 
-                                   for i in range(0, len(val_data)-seq_length+1, seq_length//2)])
+            X_val = torch.FloatTensor(X_val).to(device)
+            y_val = torch.FloatTensor(y_val).unsqueeze(1).to(device)
+            
+            # Compute validation severity scores
+            severity_val = []
+            for i in range(0, len(val_data)-seq_length+1, seq_length//2):
+                window_data = val_data.iloc[i:i+seq_length]
+                severity = compute_severity_score(window_data)
+                severity_val.append(severity)
+            severity_val = torch.FloatTensor(severity_val).unsqueeze(1).to(device)
             
             # Create data loaders
-            train_dataset = TensorDataset(X_train, y_train, torch.tensor(severity_train).float())
-            val_dataset = TensorDataset(X_val, y_val, torch.tensor(severity_val).float())
+            train_dataset = TensorDataset(X_train, y_train, severity_train)
+            val_dataset = TensorDataset(X_val, y_val, severity_val)
             train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=64)
             
@@ -254,14 +399,16 @@ def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
                     train_loader,
                     (clf_criterion, reg_criterion),
                     (clf_optimizer, reg_optimizer),
-                    device
+                    device,
+                    metrics_history
                 )
                 
                 clf_val_loss, reg_val_loss, val_acc = validate_epoch(
                     (classifier, regressor),
                     val_loader,
                     (clf_criterion, reg_criterion),
-                    device
+                    device,
+                    metrics_history
                 )
                 
                 clf_scheduler.step(clf_val_loss)
@@ -300,7 +447,7 @@ def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
     
     return best_metrics, best_seq_length
 
-def main():
+def main(metrics_history=None):
     try:
         # Set device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -312,7 +459,7 @@ def main():
         data = load_all_subjects(data_dir)
         
         # Perform cross-validation
-        best_metrics, best_seq_length = cross_validate(data)
+        best_metrics, best_seq_length = cross_validate(data, device, metrics_history=metrics_history)
         logger.info(f"Best sequence length: {best_seq_length}")
         logger.info(f"Best metrics: {best_metrics}")
         
