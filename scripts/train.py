@@ -4,123 +4,246 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import seaborn as sns
 from preprocess import preprocess_data
 from logger_config import setup_logger
+from model_comparison import ModelComparison
+from sklearn.model_selection import KFold
+import numpy as np
 from datetime import datetime
 
 # Setup logger with timestamp
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 logger = setup_logger('train', f'training_{timestamp}')
 
-class ImprovedLSTMClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 1),
-            nn.Sigmoid()
+class AttentionBiLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim=1):
+        super(AttentionBiLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
+                           batch_first=True, bidirectional=True)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
         )
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
+        
+        # Compute attention weights
+        attention_weights = self.attention(lstm_out)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        
+        # Apply attention
+        attended = torch.sum(attention_weights * lstm_out, dim=1)
+        
+        out = self.fc(attended)
+        return self.sigmoid(out)
 
-class LSTMRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim//2, 1)
-        )
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
 
-def train(model, loader, criterion, optimizer, device):
+def train_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
-    for x_batch, y_batch in tqdm(loader):
+    correct = 0
+    total = 0
+    
+    for x_batch, y_batch in train_loader:
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
         outputs = model(x_batch)
-        loss = criterion(outputs, y_batch.unsqueeze(1).float())
+        loss = criterion(outputs, y_batch)
         loss.backward()
         optimizer.step()
+        
         total_loss += loss.item()
-    return total_loss / len(loader)
+        predicted = (outputs > 0.5).float()
+        total += y_batch.size(0)
+        correct += (predicted == y_batch).sum().item()
+    
+    return total_loss / len(train_loader), correct / total
 
-def evaluate(model, loader, criterion, device):
+def validate_epoch(model, val_loader, criterion, device):
     model.eval()
     total_loss = 0
+    correct = 0
+    total = 0
+    
     with torch.no_grad():
-        for x_batch, y_batch in loader:
+        for x_batch, y_batch in val_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             outputs = model(x_batch)
-            loss = criterion(outputs, y_batch.unsqueeze(1).float())
+            loss = criterion(outputs, y_batch)
+            
             total_loss += loss.item()
-    return total_loss / len(loader)
+            predicted = (outputs > 0.5).float()
+            total += y_batch.size(0)
+            correct += (predicted == y_batch).sum().item()
+    
+    return total_loss / len(val_loader), correct / total
 
-def plot_losses(train_losses, val_losses, title):
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title(title)
-    plt.legend()
-    plt.savefig(f'{title.lower().replace(" ", "_")}_{timestamp}.png')
-    plt.close()
+def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
+    logger.info(f"Starting cross-validation with {n_splits} splits")
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    best_metrics = {}
+    
+    for seq_length in seq_lengths:
+        logger.info(f"Testing sequence length: {seq_length}")
+        fold_metrics = []
+        
+        for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
+            logger.info(f"Processing fold {fold + 1}/{n_splits}")
+            
+            # Split and preprocess data
+            train_data = data.iloc[train_idx]
+            val_data = data.iloc[val_idx]
+            
+            # Create sequences
+            X_train, y_train = create_sliding_sequences(
+                train_data[features].values, 
+                train_data['label'].values,
+                window_size=seq_length,
+                stride=seq_length//2
+            )
+            X_val, y_val = create_sliding_sequences(
+                val_data[features].values,
+                val_data['label'].values,
+                window_size=seq_length,
+                stride=seq_length//2
+            )
+            
+            # Create data loaders
+            train_dataset = TensorDataset(X_train, y_train)
+            val_dataset = TensorDataset(X_val, y_val)
+            train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=64)
+            
+            # Initialize model
+            model = AttentionBiLSTM(
+                input_dim=X_train.shape[2],
+                hidden_dim=64,
+                num_layers=2
+            ).to(device)
+            
+            criterion = nn.BCELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.1, patience=3, verbose=True
+            )
+            early_stopping = EarlyStopping(patience=5)
+            
+            # Training loop
+            train_losses = []
+            val_losses = []
+            train_accs = []
+            val_accs = []
+            
+            for epoch in range(15):
+                train_loss, train_acc = train_epoch(
+                    model, train_loader, criterion, optimizer, device
+                )
+                val_loss, val_acc = validate_epoch(
+                    model, val_loader, criterion, device
+                )
+                
+                scheduler.step(val_loss)
+                early_stopping(val_loss)
+                
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                train_accs.append(train_acc)
+                val_accs.append(val_acc)
+                
+                if early_stopping.early_stop:
+                    logger.info("Early stopping triggered")
+                    break
+            
+            fold_metrics.append({
+                'val_loss': min(val_losses),
+                'val_acc': max(val_accs),
+                'train_loss': min(train_losses),
+                'train_acc': max(train_accs)
+            })
+        
+        # Average metrics across folds
+        avg_metrics = {
+            k: np.mean([m[k] for m in fold_metrics])
+            for k in fold_metrics[0].keys()
+        }
+        
+        if not best_metrics or avg_metrics['val_acc'] > best_metrics['val_acc']:
+            best_metrics = avg_metrics
+            best_seq_length = seq_length
+    
+    return best_metrics, best_seq_length
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    data_dir = 'data'
-    seq_length = 50
-    processed_data = preprocess_data(data_dir, seq_length)
-    input_dim = processed_data['train'][0].shape[2]
-
-    train_loader = DataLoader(TensorDataset(*processed_data['train']), batch_size=32, shuffle=True)
-    val_loader = DataLoader(TensorDataset(*processed_data['val']), batch_size=32)
-
-    classifier = ImprovedLSTMClassifier(input_dim, 64, 2).to(device)
-    regressor = LSTMRegressor(input_dim, 64, 2).to(device)
-
-    clf_criterion = nn.BCELoss()
-    reg_criterion = nn.MSELoss()
-
-    clf_optimizer = optim.Adam(classifier.parameters(), lr=0.001)
-    reg_optimizer = optim.Adam(regressor.parameters(), lr=0.001)
-
-    epochs = 15
-    clf_train_losses, clf_val_losses = [], []
-    reg_train_losses, reg_val_losses = [], []
-
-    for epoch in range(epochs):
-        logger.info(f'Classifier Epoch {epoch+1}')
-        clf_train_loss = train(classifier, train_loader, clf_criterion, clf_optimizer, device)
-        clf_val_loss = evaluate(classifier, val_loader, clf_criterion, device)
-        clf_train_losses.append(clf_train_loss)
-        clf_val_losses.append(clf_val_loss)
-        logger.info(f'Classifier - Epoch {epoch+1}, Train: {clf_train_loss:.4f}, Val: {clf_val_loss:.4f}')
-
-        logger.info(f'Regressor Epoch {epoch+1}')
-        reg_train_loss = train(regressor, train_loader, reg_criterion, reg_optimizer, device)
-        reg_val_loss = evaluate(regressor, val_loader, reg_criterion, device)
-        reg_train_losses.append(reg_train_loss)
-        reg_val_losses.append(reg_val_loss)
-        logger.info(f'Regressor - Epoch {epoch+1}, Train: {reg_train_loss:.4f}, Val: {reg_val_loss:.4f}')
-
-    plot_losses(clf_train_losses, clf_val_losses, 'Classifier Losses')
-    plot_losses(reg_train_losses, reg_val_losses, 'Regressor Losses')
-
-    torch.save(classifier.state_dict(), f'models/classifier_{timestamp}.pth')
-    torch.save(regressor.state_dict(), f'models/regressor_{timestamp}.pth')
+    try:
+        # Set device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {device}")
+        
+        # Load and preprocess data
+        logger.info("Loading and preprocessing data")
+        data_dir = 'data'
+        data = load_all_subjects(data_dir)
+        
+        # Perform cross-validation
+        best_metrics, best_seq_length = cross_validate(data)
+        logger.info(f"Best sequence length: {best_seq_length}")
+        logger.info(f"Best metrics: {best_metrics}")
+        
+        # Train final model with best parameters
+        logger.info("Training final model with best parameters")
+        model = AttentionBiLSTM(
+            input_dim=63,
+            hidden_dim=64,
+            num_layers=2
+        ).to(device)
+        
+        # Save model and results
+        model_path = f'models/attention_bilstm_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
+        torch.save(model.state_dict(), model_path)
+        
+        # Add to model comparison
+        comparison = ModelComparison()
+        comparison.add_model_result(
+            'AttentionBiLSTM',
+            best_metrics,
+            {
+                'input_dim': 63,
+                'hidden_dim': 64,
+                'num_layers': 2,
+                'sequence_length': best_seq_length
+            },
+            model_path
+        )
+        
+        # Compare with previous models
+        comparison.compare_models('val_acc')
+        
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == '__main__':
     main()
