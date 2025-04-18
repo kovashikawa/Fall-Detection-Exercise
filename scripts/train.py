@@ -42,6 +42,30 @@ class AttentionBiLSTM(nn.Module):
         out = self.fc(attended)
         return self.sigmoid(out)
 
+class FallSeverityRegressor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers):
+        super(FallSeverityRegressor, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
+                           batch_first=True, bidirectional=True)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        attention_weights = self.attention(lstm_out)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        attended = torch.sum(attention_weights * lstm_out, dim=1)
+        return self.fc(attended)
+
 class EarlyStopping:
     def __init__(self, patience=5, min_delta=0):
         self.patience = patience
@@ -61,45 +85,91 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
-    model.train()
-    total_loss = 0
-    correct = 0
+def compute_severity_score(data):
+    """Compute fall severity score based on acceleration and impact features"""
+    # Calculate impact force (using acceleration magnitude)
+    acc_magnitude = np.sqrt(np.sum(data[['acc_x', 'acc_y', 'acc_z']]**2, axis=1))
+    impact_force = np.max(acc_magnitude)
+    
+    # Calculate duration of high acceleration
+    high_acc_threshold = np.percentile(acc_magnitude, 95)
+    duration = np.sum(acc_magnitude > high_acc_threshold)
+    
+    # Combine into severity score (normalized between 0 and 1)
+    severity = (impact_force * duration) / (np.max(acc_magnitude) * len(data))
+    return severity
+
+def train_epoch(models, train_loader, criteria, optimizers, device):
+    classifier, regressor = models
+    clf_criterion, reg_criterion = criteria
+    clf_optimizer, reg_optimizer = optimizers
+    
+    classifier.train()
+    regressor.train()
+    
+    clf_total_loss = 0
+    reg_total_loss = 0
+    clf_correct = 0
     total = 0
     
-    for x_batch, y_batch in train_loader:
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        outputs = model(x_batch)
-        loss = criterion(outputs, y_batch)
-        loss.backward()
-        optimizer.step()
+    for x_batch, y_batch, severity_batch in train_loader:
+        x_batch, y_batch, severity_batch = x_batch.to(device), y_batch.to(device), severity_batch.to(device)
         
-        total_loss += loss.item()
-        predicted = (outputs > 0.5).float()
+        # Train classifier
+        clf_optimizer.zero_grad()
+        clf_outputs = classifier(x_batch)
+        clf_loss = clf_criterion(clf_outputs, y_batch)
+        clf_loss.backward()
+        clf_optimizer.step()
+        
+        # Train regressor
+        reg_optimizer.zero_grad()
+        reg_outputs = regressor(x_batch)
+        reg_loss = reg_criterion(reg_outputs, severity_batch)
+        reg_loss.backward()
+        reg_optimizer.step()
+        
+        clf_total_loss += clf_loss.item()
+        reg_total_loss += reg_loss.item()
+        predicted = (clf_outputs > 0.5).float()
         total += y_batch.size(0)
-        correct += (predicted == y_batch).sum().item()
+        clf_correct += (predicted == y_batch).sum().item()
     
-    return total_loss / len(train_loader), correct / total
+    return (clf_total_loss / len(train_loader), 
+            reg_total_loss / len(train_loader), 
+            clf_correct / total)
 
-def validate_epoch(model, val_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    correct = 0
+def validate_epoch(models, val_loader, criteria, device):
+    classifier, regressor = models
+    clf_criterion, reg_criterion = criteria
+    
+    classifier.eval()
+    regressor.eval()
+    
+    clf_total_loss = 0
+    reg_total_loss = 0
+    clf_correct = 0
     total = 0
     
     with torch.no_grad():
-        for x_batch, y_batch in val_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            outputs = model(x_batch)
-            loss = criterion(outputs, y_batch)
+        for x_batch, y_batch, severity_batch in val_loader:
+            x_batch, y_batch, severity_batch = x_batch.to(device), y_batch.to(device), severity_batch.to(device)
             
-            total_loss += loss.item()
-            predicted = (outputs > 0.5).float()
+            clf_outputs = classifier(x_batch)
+            reg_outputs = regressor(x_batch)
+            
+            clf_loss = clf_criterion(clf_outputs, y_batch)
+            reg_loss = reg_criterion(reg_outputs, severity_batch)
+            
+            clf_total_loss += clf_loss.item()
+            reg_total_loss += reg_loss.item()
+            predicted = (clf_outputs > 0.5).float()
             total += y_batch.size(0)
-            correct += (predicted == y_batch).sum().item()
+            clf_correct += (predicted == y_batch).sum().item()
     
-    return total_loss / len(val_loader), correct / total
+    return (clf_total_loss / len(val_loader),
+            reg_total_loss / len(val_loader),
+            clf_correct / total)
 
 def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
     logger.info(f"Starting cross-validation with {n_splits} splits")
@@ -117,59 +187,91 @@ def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
             train_data = data.iloc[train_idx]
             val_data = data.iloc[val_idx]
             
-            # Create sequences
+            # Create sequences and compute severity scores
             X_train, y_train = create_sliding_sequences(
                 train_data[features].values, 
                 train_data['label'].values,
                 window_size=seq_length,
                 stride=seq_length//2
             )
+            severity_train = np.array([compute_severity_score(train_data.iloc[i:i+seq_length]) 
+                                     for i in range(0, len(train_data)-seq_length+1, seq_length//2)])
+            
             X_val, y_val = create_sliding_sequences(
                 val_data[features].values,
                 val_data['label'].values,
                 window_size=seq_length,
                 stride=seq_length//2
             )
+            severity_val = np.array([compute_severity_score(val_data.iloc[i:i+seq_length]) 
+                                   for i in range(0, len(val_data)-seq_length+1, seq_length//2)])
             
             # Create data loaders
-            train_dataset = TensorDataset(X_train, y_train)
-            val_dataset = TensorDataset(X_val, y_val)
+            train_dataset = TensorDataset(X_train, y_train, torch.tensor(severity_train).float())
+            val_dataset = TensorDataset(X_val, y_val, torch.tensor(severity_val).float())
             train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=64)
             
-            # Initialize model
-            model = AttentionBiLSTM(
+            # Initialize models
+            classifier = AttentionBiLSTM(
                 input_dim=X_train.shape[2],
                 hidden_dim=64,
                 num_layers=2
             ).to(device)
             
-            criterion = nn.BCELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.1, patience=3, verbose=True
+            regressor = FallSeverityRegressor(
+                input_dim=X_train.shape[2],
+                hidden_dim=64,
+                num_layers=2
+            ).to(device)
+            
+            clf_criterion = nn.BCELoss()
+            reg_criterion = nn.MSELoss()
+            
+            clf_optimizer = optim.Adam(classifier.parameters(), lr=0.001)
+            reg_optimizer = optim.Adam(regressor.parameters(), lr=0.001)
+            
+            clf_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                clf_optimizer, mode='min', factor=0.1, patience=3, verbose=True
             )
+            reg_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                reg_optimizer, mode='min', factor=0.1, patience=3, verbose=True
+            )
+            
             early_stopping = EarlyStopping(patience=5)
             
             # Training loop
-            train_losses = []
-            val_losses = []
+            clf_train_losses = []
+            reg_train_losses = []
+            clf_val_losses = []
+            reg_val_losses = []
             train_accs = []
             val_accs = []
             
             for epoch in range(15):
-                train_loss, train_acc = train_epoch(
-                    model, train_loader, criterion, optimizer, device
-                )
-                val_loss, val_acc = validate_epoch(
-                    model, val_loader, criterion, device
+                clf_train_loss, reg_train_loss, train_acc = train_epoch(
+                    (classifier, regressor),
+                    train_loader,
+                    (clf_criterion, reg_criterion),
+                    (clf_optimizer, reg_optimizer),
+                    device
                 )
                 
-                scheduler.step(val_loss)
-                early_stopping(val_loss)
+                clf_val_loss, reg_val_loss, val_acc = validate_epoch(
+                    (classifier, regressor),
+                    val_loader,
+                    (clf_criterion, reg_criterion),
+                    device
+                )
                 
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
+                clf_scheduler.step(clf_val_loss)
+                reg_scheduler.step(reg_val_loss)
+                early_stopping(clf_val_loss + reg_val_loss)
+                
+                clf_train_losses.append(clf_train_loss)
+                reg_train_losses.append(reg_train_loss)
+                clf_val_losses.append(clf_val_loss)
+                reg_val_losses.append(reg_val_loss)
                 train_accs.append(train_acc)
                 val_accs.append(val_acc)
                 
@@ -178,9 +280,11 @@ def cross_validate(data, n_splits=5, seq_lengths=[50, 100, 150]):
                     break
             
             fold_metrics.append({
-                'val_loss': min(val_losses),
+                'clf_val_loss': min(clf_val_losses),
+                'reg_val_loss': min(reg_val_losses),
                 'val_acc': max(val_accs),
-                'train_loss': min(train_losses),
+                'clf_train_loss': min(clf_train_losses),
+                'reg_train_loss': min(reg_train_losses),
                 'train_acc': max(train_accs)
             })
         
@@ -212,30 +316,52 @@ def main():
         logger.info(f"Best sequence length: {best_seq_length}")
         logger.info(f"Best metrics: {best_metrics}")
         
-        # Train final model with best parameters
-        logger.info("Training final model with best parameters")
-        model = AttentionBiLSTM(
+        # Train final models with best parameters
+        logger.info("Training final models with best parameters")
+        classifier = AttentionBiLSTM(
             input_dim=63,
             hidden_dim=64,
             num_layers=2
         ).to(device)
         
-        # Save model and results
-        model_path = f'models/attention_bilstm_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
-        torch.save(model.state_dict(), model_path)
+        regressor = FallSeverityRegressor(
+            input_dim=63,
+            hidden_dim=64,
+            num_layers=2
+        ).to(device)
+        
+        # Save models and results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        classifier_path = f'models/classifier_{timestamp}.pth'
+        regressor_path = f'models/regressor_{timestamp}.pth'
+        
+        torch.save(classifier.state_dict(), classifier_path)
+        torch.save(regressor.state_dict(), regressor_path)
         
         # Add to model comparison
         comparison = ModelComparison()
         comparison.add_model_result(
-            'AttentionBiLSTM',
-            best_metrics,
+            'AttentionBiLSTM_Classifier',
+            {k: v for k, v in best_metrics.items() if 'clf' in k or 'acc' in k},
             {
                 'input_dim': 63,
                 'hidden_dim': 64,
                 'num_layers': 2,
                 'sequence_length': best_seq_length
             },
-            model_path
+            classifier_path
+        )
+        
+        comparison.add_model_result(
+            'FallSeverityRegressor',
+            {k: v for k, v in best_metrics.items() if 'reg' in k},
+            {
+                'input_dim': 63,
+                'hidden_dim': 64,
+                'num_layers': 2,
+                'sequence_length': best_seq_length
+            },
+            regressor_path
         )
         
         # Compare with previous models
