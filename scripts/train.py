@@ -15,6 +15,26 @@ import pandas as pd
 # Setup logger
 logger = setup_logger('train', 'training')
 
+# Define feature columns
+FEATURES = [
+    'acc_x', 'acc_y', 'acc_z',
+    'ang_vel_x', 'ang_vel_y', 'ang_vel_z',
+    'mag_x', 'mag_y', 'mag_z',
+    'acc_mag', 'ang_vel_mag', 'mag_mag',
+    'vel_x', 'vel_y', 'vel_z',
+    'jerk_x', 'jerk_y', 'jerk_z',
+    'energy',
+    'acc_x_mean', 'acc_y_mean', 'acc_z_mean',
+    'acc_x_std', 'acc_y_std', 'acc_z_std',
+    'acc_x_max', 'acc_y_max', 'acc_z_max',
+    'ang_vel_x_mean', 'ang_vel_y_mean', 'ang_vel_z_mean',
+    'ang_vel_x_std', 'ang_vel_y_std', 'ang_vel_z_std',
+    'ang_vel_x_max', 'ang_vel_y_max', 'ang_vel_z_max',
+    'mag_x_mean', 'mag_y_mean', 'mag_z_mean',
+    'mag_x_std', 'mag_y_std', 'mag_z_std',
+    'mag_x_max', 'mag_y_max', 'mag_z_max'
+]
+
 def load_all_subjects(data_dir):
     """Load and combine data from all subjects"""
     logger.info("Loading data from all subjects")
@@ -32,27 +52,30 @@ def load_all_subjects(data_dir):
         logger.info(f"Processing subject: {subject_dir}")
         
         # List all trial files
-        trial_files = [f for f in os.listdir(subject_path) if f.endswith('.csv')]
+        trial_files = []
+        for root, dirs, files in os.walk(subject_path):
+            for file in files:
+                if file.endswith('.xlsx'):
+                    trial_files.append(os.path.join(root, file))
         
         if not trial_files:
-            logger.warning(f"No CSV files found in {subject_path}")
+            logger.warning(f"No Excel files found in {subject_path}")
             continue
         
         for trial_file in trial_files:
-            trial_path = os.path.join(subject_path, trial_file)
             logger.info(f"Loading trial: {trial_file}")
             
             try:
                 # Read trial data
-                trial_data = pd.read_csv(trial_path)
+                trial_data = pd.read_excel(trial_file)
                 
                 # Add subject and trial information
                 trial_data['subject'] = subject_dir
-                trial_data['trial'] = trial_file.replace('.csv', '')
+                trial_data['trial'] = os.path.basename(trial_file).replace('.xlsx', '')
                 
                 all_data.append(trial_data)
             except Exception as e:
-                logger.error(f"Error loading {trial_path}: {str(e)}")
+                logger.error(f"Error loading {trial_file}: {str(e)}")
                 continue
     
     if not all_data:
@@ -179,13 +202,13 @@ class EarlyStopping:
 
 def compute_severity_score(data):
     """Compute fall severity score based on acceleration and impact features"""
-    # Get acceleration columns
-    acc_x = data['acc_x'].values
-    acc_y = data['acc_y'].values
-    acc_z = data['acc_z'].values
+    # Get acceleration columns for all sensors
+    acc_columns = [col for col in data.columns if 'acc_mag' in col]
+    ang_vel_columns = [col for col in data.columns if 'ang_vel_mag' in col]
     
-    # Calculate total acceleration magnitude
-    acc_magnitude = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+    # Calculate total acceleration magnitude (average across all sensors)
+    acc_magnitudes = data[acc_columns].values
+    acc_magnitude = np.mean(acc_magnitudes, axis=1)
     
     # Calculate impact force (using maximum acceleration magnitude)
     impact_force = np.max(acc_magnitude)
@@ -194,13 +217,9 @@ def compute_severity_score(data):
     high_acc_threshold = np.percentile(acc_magnitude, 95)
     duration = np.sum(acc_magnitude > high_acc_threshold)
     
-    # Get angular velocity columns
-    ang_vel_x = data['ang_vel_x'].values
-    ang_vel_y = data['ang_vel_y'].values
-    ang_vel_z = data['ang_vel_z'].values
-    
-    # Calculate total angular velocity magnitude
-    ang_vel_magnitude = np.sqrt(ang_vel_x**2 + ang_vel_y**2 + ang_vel_z**2)
+    # Calculate total angular velocity magnitude (average across all sensors)
+    ang_vel_magnitudes = data[ang_vel_columns].values
+    ang_vel_magnitude = np.mean(ang_vel_magnitudes, axis=1)
     max_angular_velocity = np.max(ang_vel_magnitude)
     
     # Combine into severity score (normalized between 0 and 1)
@@ -356,73 +375,92 @@ def train_model(model, train_loader, val_loader, criterion_cls, criterion_reg, o
     
     return history
 
-def cross_validate(data, device, metrics_history=None, n_splits=5, seq_lengths=[50, 100, 150]):
+def cross_validate(data_dict, device, metrics_history=None, n_splits=5, seq_lengths=[50, 100, 150]):
     logger.info(f"Starting cross-validation with {n_splits} splits")
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     best_metrics = {}
+    
+    # Extract data components
+    X_train = data_dict['X_train']
+    y_train = data_dict['y_train']
+    X_val = data_dict['X_val']
+    y_val = data_dict['y_val']
     
     for seq_length in seq_lengths:
         logger.info(f"Testing sequence length: {seq_length}")
         fold_metrics = []
         
-        for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
-            logger.info(f"Processing fold {fold + 1}/{n_splits}")
-            
-            # Split and preprocess data
-            train_data = data.iloc[train_idx]
-            val_data = data.iloc[val_idx]
-            
-            # Create sequences and compute severity scores
-            X_train, y_train = create_sliding_sequences(
-                train_data[features].values, 
-                train_data['label'].values,
-                window_size=seq_length,
-                stride=seq_length//2
-            )
-            severity_train = np.array([compute_severity_score(train_data.iloc[i:i+seq_length]) 
-                                     for i in range(0, len(train_data)-seq_length+1, seq_length//2)])
-            
-            X_val, y_val = create_sliding_sequences(
-                val_data[features].values,
-                val_data['label'].values,
-                window_size=seq_length,
-                stride=seq_length//2
-            )
-            severity_val = np.array([compute_severity_score(val_data.iloc[i:i+seq_length]) 
-                                   for i in range(0, len(val_data)-seq_length+1, seq_length//2)])
-            
-            # Create data loaders
-            train_dataset = TensorDataset(X_train, y_train, torch.tensor(severity_train).float())
-            val_dataset = TensorDataset(X_val, y_val, torch.tensor(severity_val).float())
-            train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-            val_loader = DataLoader(val_dataset, batch_size=64)
-            
-            # Initialize model
-            input_size = X_train.shape[2]  # Number of features
-            model = AttentionBiLSTM(input_size=input_size, hidden_size=64).to(device)
-            
-            # Initialize loss functions and optimizer
-            criterion_cls = nn.BCELoss()
-            criterion_reg = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-            early_stopping = EarlyStopping(patience=5)
-            
-            # Train model
-            logger.info("Starting training...")
-            history = train_model(
-                model, train_loader, val_loader, criterion_cls, criterion_reg,
-                optimizer, scheduler, early_stopping, device
-            )
-            
-            fold_metrics.append({
-                'clf_val_loss': history['val_loss'][-1],
-                'reg_val_loss': history['val_reg_loss'][-1],
-                'val_acc': history['val_accuracy'][-1],
-                'clf_train_loss': history['train_loss'][-1],
-                'reg_train_loss': history['train_reg_loss'][-1],
-                'train_acc': history['train_accuracy'][-1]
-            })
+        # Create sequences for training data
+        X_train_seq, y_train_seq = create_sliding_sequences(
+            X_train, y_train,
+            window_size=seq_length,
+            stride=seq_length//2
+        )
+        
+        # Create sequences for validation data
+        X_val_seq, y_val_seq = create_sliding_sequences(
+            X_val, y_val,
+            window_size=seq_length,
+            stride=seq_length//2
+        )
+        
+        # Compute severity scores
+        severity_train = np.array([compute_severity_score(X_train[i:i+seq_length]) 
+                                 for i in range(0, len(X_train)-seq_length+1, seq_length//2)])
+        severity_val = np.array([compute_severity_score(X_val[i:i+seq_length]) 
+                               for i in range(0, len(X_val)-seq_length+1, seq_length//2)])
+        
+        # Create data loaders
+        train_dataset = TensorDataset(
+            torch.FloatTensor(X_train_seq),
+            torch.FloatTensor(y_train_seq),
+            torch.FloatTensor(severity_train)
+        )
+        val_dataset = TensorDataset(
+            torch.FloatTensor(X_val_seq),
+            torch.FloatTensor(y_val_seq),
+            torch.FloatTensor(severity_val)
+        )
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=64)
+        
+        # Initialize model
+        input_size = X_train.shape[1]  # Number of features
+        model = AttentionBiLSTM(input_size=input_size, hidden_size=64).to(device)
+        
+        # Initialize loss functions and optimizer
+        criterion_cls = nn.BCELoss()
+        criterion_reg = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        early_stopping = EarlyStopping(patience=5)
+        
+        # Train model
+        logger.info("Starting training...")
+        history = train_model(
+            model, train_loader, val_loader, criterion_cls, criterion_reg,
+            optimizer, scheduler, early_stopping, device
+        )
+        
+        # Update metrics history
+        if metrics_history is not None:
+            metrics_history['clf_train_loss'].append(history['train_cls_loss'][-1])
+            metrics_history['reg_train_loss'].append(history['train_reg_loss'][-1])
+            metrics_history['train_acc'].append(history['val_accuracy'][-1])
+            metrics_history['train_severity'].append(history['val_severity_mse'][-1])
+            metrics_history['clf_val_loss'].append(history['val_cls_loss'][-1])
+            metrics_history['reg_val_loss'].append(history['val_reg_loss'][-1])
+            metrics_history['val_acc'].append(history['val_accuracy'][-1])
+            metrics_history['val_severity'].append(history['val_severity_mse'][-1])
+        
+        fold_metrics.append({
+            'clf_val_loss': history['val_loss'][-1],
+            'reg_val_loss': history['val_reg_loss'][-1],
+            'val_acc': history['val_accuracy'][-1],
+            'clf_train_loss': history['train_loss'][-1],
+            'reg_train_loss': history['train_reg_loss'][-1],
+            'train_acc': history['val_accuracy'][-1]
+        })
         
         # Average metrics across folds
         avg_metrics = {

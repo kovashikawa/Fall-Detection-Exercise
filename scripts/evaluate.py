@@ -1,31 +1,55 @@
 import torch
+import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from train import LSTMClassifier
+from train import AttentionBiLSTM
 from preprocess import preprocess_data
 from logger_config import setup_logger
+import os
+from datetime import datetime
+from model_comparison import ModelComparison
+import json
 
 # Setup logger
 logger = setup_logger('evaluate', 'evaluation')
 
-def evaluate_model(model, test_loader, device):
-    logger.info("Starting model evaluation")
+def evaluate_model(model_path, test_data):
+    """Evaluate model on test data"""
+    logger.info(f"Evaluating model from {model_path}")
+    
+    # Load model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = AttentionBiLSTM(
+        input_size=test_data['input_size'],
+        hidden_size=64
+    ).to(device)
+    model.load_state_dict(torch.load(model_path))
     model.eval()
-    all_preds = []
-    all_labels = []
     
+    # Get test data
+    X_test, y_test = test_data['test']
+    X_test = X_test.to(device)
+    y_test = y_test.to(device)
+    
+    # Evaluate
     with torch.no_grad():
-        for x_batch, y_batch in test_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            outputs = model(x_batch)
-            preds = (outputs > 0.5).float()
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y_batch.cpu().numpy())
+        pred_cls, pred_severity = model(X_test)
+        pred_labels = (pred_cls > 0.5).float()
+        
+        # Calculate metrics
+        accuracy = (pred_labels == y_test.unsqueeze(1)).float().mean()
+        logger.info(f"Test Accuracy: {accuracy:.4f}")
+        
+        # Calculate severity error
+        severity_error = torch.mean((pred_severity - y_test.unsqueeze(1))**2)
+        logger.info(f"Severity MSE: {severity_error:.4f}")
     
-    logger.info("Evaluation completed")
-    return all_labels, all_preds
+    return {
+        'accuracy': accuracy.item(),
+        'severity_mse': severity_error.item()
+    }
 
 def plot_confusion_matrix(y_true, y_pred):
     logger.info("Plotting confusion matrix")
@@ -40,45 +64,31 @@ def plot_confusion_matrix(y_true, y_pred):
     logger.info("Confusion matrix saved as 'confusion_matrix.png'")
 
 def main():
-    try:
-        # Set device
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {device}")
-        
-        # Load and preprocess data
-        logger.info("Loading and preprocessing data")
-        data_dir = 'data'
-        processed_data = preprocess_data(data_dir)
-        
-        # Create test loader
-        logger.info("Creating test data loader")
-        test_dataset = TensorDataset(processed_data['test'][0], processed_data['test'][1])
-        test_loader = DataLoader(test_dataset, batch_size=64)
-        logger.info(f"Test batches: {len(test_loader)}")
-        
-        # Load model
-        logger.info("Loading trained model")
-        model = LSTMClassifier(63, 64, 2).to(device)
-        model.load_state_dict(torch.load('models/lstm_model.pth'))
-        logger.info("Model loaded successfully")
-        
-        # Evaluate model
-        logger.info("Evaluating model performance")
-        y_true, y_pred = evaluate_model(model, test_loader, device)
-        
-        # Print classification report
-        logger.info("\nClassification Report:")
-        report = classification_report(y_true, y_pred, digits=4)
-        logger.info(report)
-        
-        # Plot confusion matrix
-        plot_confusion_matrix(y_true, y_pred)
-        
-        logger.info("Evaluation completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error during evaluation: {str(e)}", exc_info=True)
-        raise
+    # Get latest model
+    comparison = ModelComparison()
+    best_model = comparison.get_best_model('val_acc')
+    
+    if best_model is None:
+        logger.error("No trained model found")
+        return
+    
+    # Load and preprocess test data
+    test_data = preprocess_data('data')
+    
+    # Evaluate model
+    metrics = evaluate_model(best_model['model_path'], test_data)
+    
+    # Save evaluation results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = f'results/evaluation_{timestamp}.json'
+    with open(results_file, 'w') as f:
+        json.dump({
+            'model_path': best_model['model_path'],
+            'metrics': metrics,
+            'timestamp': timestamp
+        }, f, indent=4)
+    
+    logger.info(f"Evaluation results saved to {results_file}")
 
 if __name__ == '__main__':
     main() 
