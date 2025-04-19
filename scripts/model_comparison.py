@@ -32,7 +32,7 @@ class ModelComparison:
             json.dump(self.results, f, indent=4)
     
     def add_model_result(self, model_name, metrics, hyperparameters, model_path):
-        """Add a new model's results to the comparison"""
+        """Add a new model's results to the comparison."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Create result entry

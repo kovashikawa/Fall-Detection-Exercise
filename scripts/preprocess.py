@@ -8,6 +8,8 @@ from logger_config import setup_logger
 import random
 from sklearn.preprocessing import StandardScaler
 import argparse
+from pathlib import Path
+import logging
 
 # Setup logger
 logger = setup_logger('preprocess', 'preprocessing')
@@ -23,113 +25,134 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# Column name mapping for standardization
+# Define column mapping for standardization
 COLUMN_MAPPING = {
-    # Acceleration columns
-    'Acceleration X (m/s^2)': 'acc_x',
-    'Acceleration Y (m/s^2)': 'acc_y',
-    'Acceleration Z (m/s^2)': 'acc_z',
-    # Angular velocity columns
-    'Angular Velocity X (rad/s)': 'ang_vel_x',
-    'Angular Velocity Y (rad/s)': 'ang_vel_y',
-    'Angular Velocity Z (rad/s)': 'ang_vel_z',
-    # Magnetometer columns
-    'Magnetic Field X (uT)': 'mag_x',
-    'Magnetic Field Y (uT)': 'mag_y',
-    'Magnetic Field Z (uT)': 'mag_z'
+    # Right ankle
+    'r.ankle Acceleration X (m/s^2)': 'r_ankle_acc_x',
+    'r.ankle Acceleration Y (m/s^2)': 'r_ankle_acc_y',
+    'r.ankle Acceleration Z (m/s^2)': 'r_ankle_acc_z',
+    'r.ankle Angular Velocity X (rad/s)': 'r_ankle_gyro_x',
+    'r.ankle Angular Velocity Y (rad/s)': 'r_ankle_gyro_y',
+    'r.ankle Angular Velocity Z (rad/s)': 'r_ankle_gyro_z',
+    'r.ankle Magnetic Field X (uT)': 'r_ankle_mag_x',
+    'r.ankle Magnetic Field Y (uT)': 'r_ankle_mag_y',
+    'r.ankle Magnetic Field Z (uT)': 'r_ankle_mag_z',
+    
+    # Left ankle
+    'l.ankle Acceleration X (m/s^2)': 'l_ankle_acc_x',
+    'l.ankle Acceleration Y (m/s^2)': 'l_ankle_acc_y',
+    'l.ankle Acceleration Z (m/s^2)': 'l_ankle_acc_z',
+    'l.ankle Angular Velocity X (rad/s)': 'l_ankle_gyro_x',
+    'l.ankle Angular Velocity Y (rad/s)': 'l_ankle_gyro_y',
+    'l.ankle Angular Velocity Z (rad/s)': 'l_ankle_gyro_z',
+    'l.ankle Magnetic Field X (uT)': 'l_ankle_mag_x',
+    'l.ankle Magnetic Field Y (uT)': 'l_ankle_mag_y',
+    'l.ankle Magnetic Field Z (uT)': 'l_ankle_mag_z',
+    
+    # Right thigh
+    'r.thigh Acceleration X (m/s^2)': 'r_thigh_acc_x',
+    'r.thigh Acceleration Y (m/s^2)': 'r_thigh_acc_y',
+    'r.thigh Acceleration Z (m/s^2)': 'r_thigh_acc_z',
+    'r.thigh Angular Velocity X (rad/s)': 'r_thigh_gyro_x',
+    'r.thigh Angular Velocity Y (rad/s)': 'r_thigh_gyro_y',
+    'r.thigh Angular Velocity Z (rad/s)': 'r_thigh_gyro_z',
+    'r.thigh Magnetic Field X (uT)': 'r_thigh_mag_x',
+    'r.thigh Magnetic Field Y (uT)': 'r_thigh_mag_y',
+    'r.thigh Magnetic Field Z (uT)': 'r_thigh_mag_z',
+    
+    # Left thigh
+    'l.thigh Acceleration X (m/s^2)': 'l_thigh_acc_x',
+    'l.thigh Acceleration Y (m/s^2)': 'l_thigh_acc_y',
+    'l.thigh Acceleration Z (m/s^2)': 'l_thigh_acc_z',
+    'l.thigh Angular Velocity X (rad/s)': 'l_thigh_gyro_x',
+    'l.thigh Angular Velocity Y (rad/s)': 'l_thigh_gyro_y',
+    'l.thigh Angular Velocity Z (rad/s)': 'l_thigh_gyro_z',
+    'l.thigh Magnetic Field X (uT)': 'l_thigh_mag_x',
+    'l.thigh Magnetic Field Y (uT)': 'l_thigh_mag_y',
+    'l.thigh Magnetic Field Z (uT)': 'l_thigh_mag_z',
+    
+    # Head
+    'head Acceleration X (m/s^2)': 'head_acc_x',
+    'head Acceleration Y (m/s^2)': 'head_acc_y',
+    'head Acceleration Z (m/s^2)': 'head_acc_z',
+    'head Angular Velocity X (rad/s)': 'head_gyro_x',
+    'head Angular Velocity Y (rad/s)': 'head_gyro_y',
+    'head Angular Velocity Z (rad/s)': 'head_gyro_z',
+    'head Magnetic Field X (uT)': 'head_mag_x',
+    'head Magnetic Field Y (uT)': 'head_mag_y',
+    'head Magnetic Field Z (uT)': 'head_mag_z',
+    
+    # Sternum
+    'sternum Acceleration X (m/s^2)': 'sternum_acc_x',
+    'sternum Acceleration Y (m/s^2)': 'sternum_acc_y',
+    'sternum Acceleration Z (m/s^2)': 'sternum_acc_z',
+    'sternum Angular Velocity X (rad/s)': 'sternum_gyro_x',
+    'sternum Angular Velocity Y (rad/s)': 'sternum_gyro_y',
+    'sternum Angular Velocity Z (rad/s)': 'sternum_gyro_z',
+    'sternum Magnetic Field X (uT)': 'sternum_mag_x',
+    'sternum Magnetic Field Y (uT)': 'sternum_mag_y',
+    'sternum Magnetic Field Z (uT)': 'sternum_mag_z',
+    
+    # Waist
+    'waist Acceleration X (m/s^2)': 'waist_acc_x',
+    'waist Acceleration Y (m/s^2)': 'waist_acc_y',
+    'waist Acceleration Z (m/s^2)': 'waist_acc_z',
+    'waist Angular Velocity X (rad/s)': 'waist_gyro_x',
+    'waist Angular Velocity Y (rad/s)': 'waist_gyro_y',
+    'waist Angular Velocity Z (rad/s)': 'waist_gyro_z',
+    'waist Magnetic Field X (uT)': 'waist_mag_x',
+    'waist Magnetic Field Y (uT)': 'waist_mag_y',
+    'waist Magnetic Field Z (uT)': 'waist_mag_z',
+    
+    # Time column
+    'Time': 'time'
 }
 
 def standardize_column_names(df):
-    """Standardize column names using the mapping"""
-    # Create a new mapping that handles any sensor prefix
-    prefix_mapping = {}
-    for col in df.columns:
-        if col == 'Time':
-            prefix_mapping[col] = 'timestamp'
-            continue
-        for old_name, new_name in COLUMN_MAPPING.items():
-            if old_name in col:
-                # Extract sensor prefix (e.g., 'r.ankle', 'l.ankle')
-                prefix = col.split(' ')[0]
-                prefix_mapping[col] = f'{prefix}_{new_name}'
-    
-    # Rename columns
-    df = df.rename(columns=prefix_mapping)
-    
-    # Add label column based on directory structure
-    if 'Falls' in df['trial'].iloc[0]:
-        df['label'] = 1
-    elif 'Near_Falls' in df['trial'].iloc[0]:
-        df['label'] = 0.5  # Intermediate severity for near falls
-    else:
-        df['label'] = 0
-    
-    return df
+    """Standardize column names using the mapping."""
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    return df.rename(columns=COLUMN_MAPPING)
 
 def load_trial(filepath, label):
-    """Load and preprocess a single trial file"""
-    logger.info(f"Loading trial: {filepath}")
-    
+    """Load a single trial from an Excel file and standardize column names."""
     try:
-        # Read trial data
         df = pd.read_excel(filepath)
-        
-        # Add trial information
-        df['trial'] = os.path.basename(filepath).replace('.xlsx', '')
-        df['label'] = label
-        
-        # Standardize column names
         df = standardize_column_names(df)
-        
+        df['label'] = label
+        df['trial'] = filepath.stem
         return df
     except Exception as e:
-        logger.error(f"Error loading {filepath}: {str(e)}")
+        logger.error(f"Error loading trial {filepath}: {str(e)}")
         return None
 
-def load_subject_data(subject_path):
-    """Load all trials for a subject"""
-    logger.info(f"Loading data for subject: {os.path.basename(subject_path)}")
+def load_subject_data(subject_dir):
+    """Load all trials for a subject."""
+    subject_dir = Path(subject_dir)
+    falls_dir = subject_dir / 'Falls'
+    adls_dir = subject_dir / 'ADLs'
+    
     all_trials = []
     
-    # Load falls
-    falls_dir = os.path.join(subject_path, 'Falls')
-    if os.path.exists(falls_dir):
-        for trial_file in os.listdir(falls_dir):
-            if trial_file.endswith('.xlsx'):
-                trial_path = os.path.join(falls_dir, trial_file)
-                trial_df = load_trial(trial_path, label=1)  # Falls are labeled as 1
-                if trial_df is not None:
-                    all_trials.append(trial_df)
+    # Load fall trials
+    if falls_dir.exists():
+        for trial_file in falls_dir.glob('*.xlsx'):
+            df = load_trial(trial_file, label=1)
+            if df is not None:
+                all_trials.append(df)
     
-    # Load near falls
-    near_falls_dir = os.path.join(subject_path, 'Near_Falls')
-    if os.path.exists(near_falls_dir):
-        for trial_file in os.listdir(near_falls_dir):
-            if trial_file.endswith('.xlsx'):
-                trial_path = os.path.join(near_falls_dir, trial_file)
-                trial_df = load_trial(trial_path, label=0.5)  # Near falls are labeled as 0.5
-                if trial_df is not None:
-                    all_trials.append(trial_df)
-    
-    # Load ADLs
-    adls_dir = os.path.join(subject_path, 'ADLs')
-    if os.path.exists(adls_dir):
-        for trial_file in os.listdir(adls_dir):
-            if trial_file.endswith('.xlsx'):
-                trial_path = os.path.join(adls_dir, trial_file)
-                trial_df = load_trial(trial_path, label=0)  # ADLs are labeled as 0
-                if trial_df is not None:
-                    all_trials.append(trial_df)
+    # Load ADL trials
+    if adls_dir.exists():
+        for trial_file in adls_dir.glob('*.xlsx'):
+            df = load_trial(trial_file, label=0)
+            if df is not None:
+                all_trials.append(df)
     
     if not all_trials:
-        logger.warning(f"No valid trials found for subject {os.path.basename(subject_path)}")
+        logger.warning(f"No data found in {subject_dir}")
         return None
     
-    # Combine all trials
-    subject_data = pd.concat(all_trials, ignore_index=True)
-    logger.info(f"Loaded {len(all_trials)} trials for subject {os.path.basename(subject_path)}")
-    
-    return subject_data
+    return pd.concat(all_trials, ignore_index=True)
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fall-Detection preprocessing")
@@ -181,163 +204,150 @@ def load_all_subjects(data_dir, sample_frac=1.0):
     return combined_data
 
 def compute_derived_features(data):
-    """Compute derived features from raw sensor data"""
-    logger.info("Computing derived features")
-    feature_names = []
+    """Compute derived features from sensor data."""
+    feature_data = data.copy()
     
-    # Get unique sensor prefixes
-    sensor_prefixes = set(col.split('_')[0] for col in data.columns if '_' in col)
+    # List of sensors
+    sensors = ['r_ankle', 'l_ankle', 'r_thigh', 'l_thigh', 'head', 'sternum', 'waist']
     
-    for prefix in sensor_prefixes:
-        # Get sensor data
-        acc_x = data[f'{prefix}_acc_x']
-        acc_y = data[f'{prefix}_acc_y']
-        acc_z = data[f'{prefix}_acc_z']
-        ang_vel_x = data[f'{prefix}_ang_vel_x']
-        ang_vel_y = data[f'{prefix}_ang_vel_y']
-        ang_vel_z = data[f'{prefix}_ang_vel_z']
-        mag_x = data[f'{prefix}_mag_x']
-        mag_y = data[f'{prefix}_mag_y']
-        mag_z = data[f'{prefix}_mag_z']
+    for sensor in sensors:
+        # Compute acceleration magnitude
+        acc_cols = [f'{sensor}_acc_x', f'{sensor}_acc_y', f'{sensor}_acc_z']
+        feature_data[f'{sensor}_acc_mag'] = np.sqrt(
+            feature_data[acc_cols].pow(2).sum(axis=1)
+        )
         
-        # Compute magnitudes
-        data[f'{prefix}_acc_mag'] = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
-        data[f'{prefix}_ang_vel_mag'] = np.sqrt(ang_vel_x**2 + ang_vel_y**2 + ang_vel_z**2)
-        data[f'{prefix}_mag_mag'] = np.sqrt(mag_x**2 + mag_y**2 + mag_z**2)
+        # Compute angular velocity magnitude
+        gyro_cols = [f'{sensor}_gyro_x', f'{sensor}_gyro_y', f'{sensor}_gyro_z']
+        feature_data[f'{sensor}_gyro_mag'] = np.sqrt(
+            feature_data[gyro_cols].pow(2).sum(axis=1)
+        )
         
-        # Compute velocities (integrate acceleration)
-        data[f'{prefix}_vel_x'] = acc_x.cumsum()
-        data[f'{prefix}_vel_y'] = acc_y.cumsum()
-        data[f'{prefix}_vel_z'] = acc_z.cumsum()
-        
-        # Compute jerk (derivative of acceleration)
-        data[f'{prefix}_jerk_x'] = acc_x.diff()
-        data[f'{prefix}_jerk_y'] = acc_y.diff()
-        data[f'{prefix}_jerk_z'] = acc_z.diff()
-        
-        # Compute energy
-        data[f'{prefix}_energy'] = data[f'{prefix}_acc_mag']**2 + data[f'{prefix}_ang_vel_mag']**2
-        
-        # Compute rolling statistics
-        window_size = 10
-        for axis in ['x', 'y', 'z']:
-            # Acceleration statistics
-            data[f'{prefix}_acc_{axis}_mean'] = data[f'{prefix}_acc_{axis}'].rolling(window=window_size).mean()
-            data[f'{prefix}_acc_{axis}_std'] = data[f'{prefix}_acc_{axis}'].rolling(window=window_size).std()
-            data[f'{prefix}_acc_{axis}_max'] = data[f'{prefix}_acc_{axis}'].rolling(window=window_size).max()
-            
-            # Angular velocity statistics
-            data[f'{prefix}_ang_vel_{axis}_mean'] = data[f'{prefix}_ang_vel_{axis}'].rolling(window=window_size).mean()
-            data[f'{prefix}_ang_vel_{axis}_std'] = data[f'{prefix}_ang_vel_{axis}'].rolling(window=window_size).std()
-            data[f'{prefix}_ang_vel_{axis}_max'] = data[f'{prefix}_ang_vel_{axis}'].rolling(window=window_size).max()
-            
-            # Magnetometer statistics
-            data[f'{prefix}_mag_{axis}_mean'] = data[f'{prefix}_mag_{axis}'].rolling(window=window_size).mean()
-            data[f'{prefix}_mag_{axis}_std'] = data[f'{prefix}_mag_{axis}'].rolling(window=window_size).std()
-            data[f'{prefix}_mag_{axis}_max'] = data[f'{prefix}_mag_{axis}'].rolling(window=window_size).max()
-        
-        # Add feature names
-        feature_names.extend([
-            f'{prefix}_acc_x', f'{prefix}_acc_y', f'{prefix}_acc_z',
-            f'{prefix}_ang_vel_x', f'{prefix}_ang_vel_y', f'{prefix}_ang_vel_z',
-            f'{prefix}_mag_x', f'{prefix}_mag_y', f'{prefix}_mag_z',
-            f'{prefix}_acc_mag', f'{prefix}_ang_vel_mag', f'{prefix}_mag_mag',
-            f'{prefix}_vel_x', f'{prefix}_vel_y', f'{prefix}_vel_z',
-            f'{prefix}_jerk_x', f'{prefix}_jerk_y', f'{prefix}_jerk_z',
-            f'{prefix}_energy',
-            f'{prefix}_acc_x_mean', f'{prefix}_acc_y_mean', f'{prefix}_acc_z_mean',
-            f'{prefix}_acc_x_std', f'{prefix}_acc_y_std', f'{prefix}_acc_z_std',
-            f'{prefix}_acc_x_max', f'{prefix}_acc_y_max', f'{prefix}_acc_z_max',
-            f'{prefix}_ang_vel_x_mean', f'{prefix}_ang_vel_y_mean', f'{prefix}_ang_vel_z_mean',
-            f'{prefix}_ang_vel_x_std', f'{prefix}_ang_vel_y_std', f'{prefix}_ang_vel_z_std',
-            f'{prefix}_ang_vel_x_max', f'{prefix}_ang_vel_y_max', f'{prefix}_ang_vel_z_max',
-            f'{prefix}_mag_x_mean', f'{prefix}_mag_y_mean', f'{prefix}_mag_z_mean',
-            f'{prefix}_mag_x_std', f'{prefix}_mag_y_std', f'{prefix}_mag_z_std',
-            f'{prefix}_mag_x_max', f'{prefix}_mag_y_max', f'{prefix}_mag_z_max'
-        ])
+        # Compute magnetic field magnitude
+        mag_cols = [f'{sensor}_mag_x', f'{sensor}_mag_y', f'{sensor}_mag_z']
+        feature_data[f'{sensor}_mag_mag'] = np.sqrt(
+            feature_data[mag_cols].pow(2).sum(axis=1)
+        )
     
-    # Fill NaN values
-    data = data.ffill().bfill()
-    
-    logger.info(f"Computed {len(feature_names)} derived features")
-    return data, feature_names
+    return feature_data
 
-def create_sequences(X, y, seq_length=100, stride=50):
-    """Create sequences for LSTM input."""
-    logger.info(f"Creating sequences with length {seq_length} and stride {stride}")
-    sequences, labels = [], []
-    
-    # Ensure we don't cross trial boundaries
-    trial_boundaries = np.where(np.diff(y) != 0)[0] + 1
-    trial_boundaries = np.concatenate([[0], trial_boundaries, [len(y)]])
-    
-    for i in range(len(trial_boundaries) - 1):
-        start_idx = trial_boundaries[i]
-        end_idx = trial_boundaries[i + 1]
-        trial_X = X[start_idx:end_idx]
-        trial_y = y[start_idx:end_idx]
+def create_sequences_generator(X, y, seq_length=100, stride=1):
+    """Create sequences using a generator to save memory."""
+    for trial in X['trial'].unique():
+        trial_data = X[X['trial'] == trial].copy()
+        trial_labels = y[X['trial'] == trial].copy()
         
-        # Create sequences within this trial
-        for j in range(0, len(trial_X) - seq_length + 1, stride):
-            sequences.append(trial_X[j:j+seq_length])
-            labels.append(trial_y[j+seq_length-1])
-    
-    # Convert lists to numpy arrays before creating tensors
-    sequences = np.array(sequences)
-    labels = np.array(labels)
-    
-    logger.info(f"Created {len(sequences)} sequences")
-    return sequences, labels
+        # Drop trial column before creating sequences
+        trial_data = trial_data.drop(columns=['trial'])
+        
+        # Process in smaller chunks
+        chunk_size = 500
+        for i in range(0, len(trial_data), chunk_size):
+            chunk_data = trial_data.iloc[i:i + chunk_size].copy()
+            chunk_labels = trial_labels.iloc[i:i + chunk_size].copy()
+            
+            for j in range(0, len(chunk_data) - seq_length + 1, stride):
+                seq = chunk_data.iloc[j:j + seq_length].values
+                # Use the majority label in the sequence
+                label = chunk_labels.iloc[j:j + seq_length].mode()[0]
+                yield seq, label
+            
+            # Clear memory
+            del chunk_data
+            del chunk_labels
+        
+        # Clear memory
+        del trial_data
+        del trial_labels
 
-def preprocess_data(data_dir, seq_length=100, stride=50, sample_frac=1.0):
-    """Main preprocessing function."""
+def collect_sequences(generator, max_sequences=10000):
+    """Collect sequences from generator up to a maximum count."""
+    sequences = []
+    labels = []
+    count = 0
+    
+    for seq, label in generator:
+        sequences.append(seq)
+        labels.append(label)
+        count += 1
+        
+        if count >= max_sequences:
+            break
+    
+    return np.array(sequences), np.array(labels)
+
+def preprocess_data(data_dir, sample_frac=0.1, max_sequences=10000):
+    """Preprocess data for training."""
     logger.info("Starting data preprocessing")
-    
-    # Set random seeds
-    set_seeds()
     
     # Load data
     logger.info("Loading data")
     data = load_all_subjects(data_dir, sample_frac)
-    logger.info(f"Loaded data shape: {data.shape}")
     
-    # Handle missing values
-    logger.info("Handling missing values")
-    data.fillna(method='ffill', inplace=True)
-    data.dropna(inplace=True)
-    logger.info(f"Data shape after handling missing values: {data.shape}")
+    # Standardize column names
+    logger.info("Standardizing column names")
+    data = standardize_column_names(data)
     
     # Compute derived features
-    data, feature_names = compute_derived_features(data)
+    data = compute_derived_features(data)
     
-    # Scale features
+    # Select only numeric columns for scaling
+    numeric_cols = data.select_dtypes(include=[np.number]).columns
+    feature_cols = [col for col in numeric_cols if col not in ['label']]
+    
+    # Scale features in chunks
     logger.info("Scaling features")
     scaler = StandardScaler()
-    X = data[feature_names].values
-    X_scaled = scaler.fit_transform(X)
-    data[feature_names] = X_scaled
+    chunk_size = 5000
+    
+    # First pass to fit the scaler
+    for i in range(0, len(data), chunk_size):
+        chunk = data.iloc[i:i + chunk_size].copy()
+        X = chunk[feature_cols].values
+        scaler.partial_fit(X)
+        del chunk, X
+    
+    # Second pass to transform the data
+    for i in range(0, len(data), chunk_size):
+        chunk = data.iloc[i:i + chunk_size].copy()
+        X = chunk[feature_cols].values
+        X_scaled = scaler.transform(X)
+        data.iloc[i:i + chunk_size, data.columns.get_indexer(feature_cols)] = X_scaled
+        del chunk, X, X_scaled
     
     # Select features and labels
     logger.info("Selecting features and labels")
-    X = data[feature_names].values
-    y = data['label'].values
-    logger.info(f"Selected {len(feature_names)} features")
+    X = data[feature_cols + ['trial']].copy()
+    y = data['label'].copy()
+    logger.info(f"Selected {len(feature_cols)} features")
+    
+    # Clear original data
+    del data
     
     # Split data
-    logger.info("Splitting data into train/val/test sets")
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42)
-    logger.info(f"Train set size: {len(X_train)}")
-    logger.info(f"Validation set size: {len(X_val)}")
-    logger.info(f"Test set size: {len(X_test)}")
+    logger.info("Splitting data")
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
     
-    # Create sequences
-    logger.info("Creating sequences for LSTM input")
-    X_train_seq, y_train_seq = create_sequences(X_train, y_train, seq_length, stride)
-    X_val_seq, y_val_seq = create_sequences(X_val, y_val, seq_length, stride)
-    X_test_seq, y_test_seq = create_sequences(X_test, y_test, seq_length, stride)
+    # Clear memory
+    del X
+    del y
+    
+    # Create sequences using generators
+    logger.info("Creating sequences")
+    train_gen = create_sequences_generator(X_train, y_train)
+    val_gen = create_sequences_generator(X_val, y_val)
+    test_gen = create_sequences_generator(X_test, y_test)
+    
+    X_train_seq, y_train_seq = collect_sequences(train_gen, max_sequences)
+    X_val_seq, y_val_seq = collect_sequences(val_gen, max_sequences // 5)
+    X_test_seq, y_test_seq = collect_sequences(test_gen, max_sequences // 5)
+    
+    # Clear memory
+    del X_train, y_train, X_val, y_val, X_test, y_test
     
     # Convert to tensors
+    logger.info("Converting to tensors")
     X_train_tensor = torch.FloatTensor(X_train_seq)
     y_train_tensor = torch.FloatTensor(y_train_seq)
     X_val_tensor = torch.FloatTensor(X_val_seq)
@@ -345,14 +355,15 @@ def preprocess_data(data_dir, seq_length=100, stride=50, sample_frac=1.0):
     X_test_tensor = torch.FloatTensor(X_test_seq)
     y_test_tensor = torch.FloatTensor(y_test_seq)
     
-    logger.info("Preprocessing completed successfully")
+    # Clear memory
+    del X_train_seq, y_train_seq, X_val_seq, y_val_seq, X_test_seq, y_test_seq
     
     return {
         'train': (X_train_tensor, y_train_tensor),
         'val': (X_val_tensor, y_val_tensor),
         'test': (X_test_tensor, y_test_tensor),
-        'feature_names': feature_names,
-        'input_size': len(feature_names),
+        'feature_names': feature_cols,
+        'input_size': len(feature_cols),
         'scaler': scaler
     }
 

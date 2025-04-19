@@ -229,91 +229,104 @@ def compute_severity_score(data):
     return float(severity)
 
 def train_epoch(model, train_loader, criterion_cls, criterion_reg, optimizer, device):
+    """Train for one epoch."""
     model.train()
     total_loss = 0
     total_cls_loss = 0
     total_reg_loss = 0
     
-    for batch_X, batch_y, batch_severity in train_loader:
+    for batch_X, batch_y in train_loader:
         batch_X = batch_X.to(device)
-        batch_y = batch_y.to(device)
-        batch_severity = batch_severity.to(device)
-        
-        optimizer.zero_grad()
+        batch_y = batch_y.to(device).float()  # Ensure float type for BCE loss
         
         # Forward pass
-        pred_cls, pred_severity = model(batch_X)
+        y_pred, _ = model(batch_X)
         
-        # Compute losses
-        cls_loss = criterion_cls(pred_cls, batch_y.unsqueeze(1))
-        reg_loss = criterion_reg(pred_severity, batch_severity.unsqueeze(1))
+        # Ensure consistent shapes
+        y_pred = y_pred.view(-1)
+        batch_y = batch_y.view(-1)
+        
+        # Compute loss
+        cls_loss = criterion_cls(y_pred, batch_y)
+        reg_loss = 0  # No severity prediction for now
         loss = cls_loss + reg_loss
         
         # Backward pass
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
         total_cls_loss += cls_loss.item()
-        total_reg_loss += reg_loss.item()
+        total_reg_loss += reg_loss
     
-    return total_loss / len(train_loader), total_cls_loss / len(train_loader), total_reg_loss / len(train_loader)
+    avg_loss = total_loss / len(train_loader)
+    avg_cls_loss = total_cls_loss / len(train_loader)
+    avg_reg_loss = total_reg_loss / len(train_loader)
+    
+    return avg_loss, avg_cls_loss, avg_reg_loss
 
 def validate(model, val_loader, criterion_cls, criterion_reg, device):
+    """Validate the model."""
     model.eval()
     total_loss = 0
     total_cls_loss = 0
     total_reg_loss = 0
+    
     all_preds = []
     all_labels = []
-    all_severity = []
-    all_pred_severity = []
     
     with torch.no_grad():
-        for batch_X, batch_y, batch_severity in val_loader:
+        for batch_X, batch_y in val_loader:
             batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
-            batch_severity = batch_severity.to(device)
+            batch_y = batch_y.to(device).float()  # Ensure float type for BCE loss
             
             # Forward pass
-            pred_cls, pred_severity = model(batch_X)
+            y_pred, _ = model(batch_X)
             
-            # Compute losses
-            cls_loss = criterion_cls(pred_cls, batch_y.unsqueeze(1))
-            reg_loss = criterion_reg(pred_severity, batch_severity.unsqueeze(1))
+            # Ensure consistent shapes
+            y_pred = y_pred.view(-1)
+            batch_y = batch_y.view(-1)
+            
+            # Compute loss
+            cls_loss = criterion_cls(y_pred, batch_y)
+            reg_loss = 0  # No severity prediction for now
             loss = cls_loss + reg_loss
             
             total_loss += loss.item()
             total_cls_loss += cls_loss.item()
-            total_reg_loss += reg_loss.item()
+            total_reg_loss += reg_loss
             
-            # Store predictions
-            all_preds.extend((pred_cls > 0.5).float().cpu().numpy())
+            # Store predictions and labels for metrics
+            all_preds.extend((y_pred > 0.5).cpu().numpy())
             all_labels.extend(batch_y.cpu().numpy())
-            all_severity.extend(batch_severity.cpu().numpy())
-            all_pred_severity.extend(pred_severity.cpu().numpy())
     
-    # Calculate metrics
+    # Compute average losses
+    avg_loss = total_loss / len(val_loader)
+    avg_cls_loss = total_cls_loss / len(val_loader)
+    avg_reg_loss = total_reg_loss / len(val_loader)
+    
+    # Compute metrics
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
-    all_severity = np.array(all_severity)
-    all_pred_severity = np.array(all_pred_severity)
     
-    metrics = {
-        'loss': total_loss / len(val_loader),
-        'cls_loss': total_cls_loss / len(val_loader),
-        'reg_loss': total_reg_loss / len(val_loader),
-        'accuracy': accuracy_score(all_labels, all_preds),
-        'precision': precision_score(all_labels, all_preds),
-        'recall': recall_score(all_labels, all_preds),
-        'f1': f1_score(all_labels, all_preds),
-        'severity_mse': np.mean((all_severity - all_pred_severity) ** 2)
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    
+    return {
+        'val_loss': avg_loss,
+        'val_cls_loss': avg_cls_loss,
+        'val_reg_loss': avg_reg_loss,
+        'val_accuracy': accuracy,
+        'val_precision': precision,
+        'val_recall': recall,
+        'val_f1': f1
     }
-    
-    return metrics
 
 def train_model(model, train_loader, val_loader, criterion_cls, criterion_reg, optimizer, 
-                scheduler, early_stopping, device, num_epochs=100):
+                scheduler, early_stopping, device, num_epochs=20):
     best_val_loss = float('inf')
     history = {
         'train_loss': [],
@@ -325,8 +338,7 @@ def train_model(model, train_loader, val_loader, criterion_cls, criterion_reg, o
         'val_accuracy': [],
         'val_precision': [],
         'val_recall': [],
-        'val_f1': [],
-        'val_severity_mse': []
+        'val_f1': []
     }
     
     for epoch in range(num_epochs):
@@ -338,139 +350,126 @@ def train_model(model, train_loader, val_loader, criterion_cls, criterion_reg, o
         # Validation
         val_metrics = validate(model, val_loader, criterion_cls, criterion_reg, device)
         
+        # Log detailed metrics for debugging
+        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+        logger.info(f"Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, Reg: {train_reg_loss:.4f})")
+        logger.info(f"Val Loss: {val_metrics['val_loss']:.4f} (Cls: {val_metrics['val_cls_loss']:.4f}, Reg: {val_metrics['val_reg_loss']:.4f})")
+        logger.info(f"Val Metrics - Acc: {val_metrics['val_accuracy']:.4f}, Prec: {val_metrics['val_precision']:.4f}, "
+                   f"Rec: {val_metrics['val_recall']:.4f}, F1: {val_metrics['val_f1']:.4f}")
+        
         # Update learning rate
-        scheduler.step(val_metrics['loss'])
+        scheduler.step(val_metrics['val_loss'])
         
         # Early stopping check
-        early_stopping(val_metrics['loss'])
+        early_stopping(val_metrics['val_loss'])
         if early_stopping.early_stop:
             logger.info(f"Early stopping at epoch {epoch}")
             break
         
         # Save best model
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
+        if val_metrics['val_loss'] < best_val_loss:
+            best_val_loss = val_metrics['val_loss']
             torch.save(model.state_dict(), f'models/classifier_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth')
         
         # Update history
         history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_metrics['loss'])
+        history['val_loss'].append(val_metrics['val_loss'])
         history['train_cls_loss'].append(train_cls_loss)
-        history['val_cls_loss'].append(val_metrics['cls_loss'])
+        history['val_cls_loss'].append(val_metrics['val_cls_loss'])
         history['train_reg_loss'].append(train_reg_loss)
-        history['val_reg_loss'].append(val_metrics['reg_loss'])
-        history['val_accuracy'].append(val_metrics['accuracy'])
-        history['val_precision'].append(val_metrics['precision'])
-        history['val_recall'].append(val_metrics['recall'])
-        history['val_f1'].append(val_metrics['f1'])
-        history['val_severity_mse'].append(val_metrics['severity_mse'])
-        
-        # Log progress
-        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-        logger.info(f"Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, Reg: {train_reg_loss:.4f})")
-        logger.info(f"Val Loss: {val_metrics['loss']:.4f} (Cls: {val_metrics['cls_loss']:.4f}, Reg: {val_metrics['reg_loss']:.4f})")
-        logger.info(f"Val Metrics - Acc: {val_metrics['accuracy']:.4f}, Prec: {val_metrics['precision']:.4f}, "
-                   f"Rec: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}")
-        logger.info(f"Val Severity MSE: {val_metrics['severity_mse']:.4f}")
+        history['val_reg_loss'].append(val_metrics['val_reg_loss'])
+        history['val_accuracy'].append(val_metrics['val_accuracy'])
+        history['val_precision'].append(val_metrics['val_precision'])
+        history['val_recall'].append(val_metrics['val_recall'])
+        history['val_f1'].append(val_metrics['val_f1'])
     
     return history
 
 def cross_validate(data_dict, device, metrics_history=None, n_splits=5, seq_lengths=[50, 100, 150]):
+    """Perform k-fold cross-validation with different sequence lengths."""
     logger.info(f"Starting cross-validation with {n_splits} splits")
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-    best_metrics = {}
     
-    # Extract data components
-    X_train = data_dict['X_train']
-    y_train = data_dict['y_train']
-    X_val = data_dict['X_val']
-    y_val = data_dict['y_val']
+    # Unpack data
+    X_train, y_train = data_dict['train']
+    X_val, y_val = data_dict['val']
+    input_size = data_dict['input_size']
+    
+    best_metrics = None
+    best_seq_length = None
+    best_val_loss = float('inf')
     
     for seq_length in seq_lengths:
         logger.info(f"Testing sequence length: {seq_length}")
+        
+        # Initialize k-fold cross-validation
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         fold_metrics = []
         
-        # Create sequences for training data
-        X_train_seq, y_train_seq = create_sliding_sequences(
-            X_train, y_train,
-            window_size=seq_length,
-            stride=seq_length//2
-        )
+        # Convert tensors to numpy for splitting
+        X_train_np = X_train.numpy()
+        y_train_np = y_train.numpy()
         
-        # Create sequences for validation data
-        X_val_seq, y_val_seq = create_sliding_sequences(
-            X_val, y_val,
-            window_size=seq_length,
-            stride=seq_length//2
-        )
-        
-        # Compute severity scores
-        severity_train = np.array([compute_severity_score(X_train[i:i+seq_length]) 
-                                 for i in range(0, len(X_train)-seq_length+1, seq_length//2)])
-        severity_val = np.array([compute_severity_score(X_val[i:i+seq_length]) 
-                               for i in range(0, len(X_val)-seq_length+1, seq_length//2)])
-        
-        # Create data loaders
-        train_dataset = TensorDataset(
-            torch.FloatTensor(X_train_seq),
-            torch.FloatTensor(y_train_seq),
-            torch.FloatTensor(severity_train)
-        )
-        val_dataset = TensorDataset(
-            torch.FloatTensor(X_val_seq),
-            torch.FloatTensor(y_val_seq),
-            torch.FloatTensor(severity_val)
-        )
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=64)
-        
-        # Initialize model
-        input_size = X_train.shape[1]  # Number of features
-        model = AttentionBiLSTM(input_size=input_size, hidden_size=64).to(device)
-        
-        # Initialize loss functions and optimizer
-        criterion_cls = nn.BCELoss()
-        criterion_reg = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-        early_stopping = EarlyStopping(patience=5)
-        
-        # Train model
-        logger.info("Starting training...")
-        history = train_model(
-            model, train_loader, val_loader, criterion_cls, criterion_reg,
-            optimizer, scheduler, early_stopping, device
-        )
-        
-        # Update metrics history
-        if metrics_history is not None:
-            metrics_history['clf_train_loss'].append(history['train_cls_loss'][-1])
-            metrics_history['reg_train_loss'].append(history['train_reg_loss'][-1])
-            metrics_history['train_acc'].append(history['val_accuracy'][-1])
-            metrics_history['train_severity'].append(history['val_severity_mse'][-1])
-            metrics_history['clf_val_loss'].append(history['val_cls_loss'][-1])
-            metrics_history['reg_val_loss'].append(history['val_reg_loss'][-1])
-            metrics_history['val_acc'].append(history['val_accuracy'][-1])
-            metrics_history['val_severity'].append(history['val_severity_mse'][-1])
-        
-        fold_metrics.append({
-            'clf_val_loss': history['val_loss'][-1],
-            'reg_val_loss': history['val_reg_loss'][-1],
-            'val_acc': history['val_accuracy'][-1],
-            'clf_train_loss': history['train_loss'][-1],
-            'reg_train_loss': history['train_reg_loss'][-1],
-            'train_acc': history['val_accuracy'][-1]
-        })
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_np)):
+            logger.info(f"Training fold {fold + 1}/{n_splits}")
+            
+            # Split data
+            X_train_fold = torch.FloatTensor(X_train_np[train_idx]).to(device)
+            y_train_fold = torch.FloatTensor(y_train_np[train_idx]).to(device)
+            X_val_fold = torch.FloatTensor(X_train_np[val_idx]).to(device)
+            y_val_fold = torch.FloatTensor(y_train_np[val_idx]).to(device)
+            
+            # Create data loaders
+            train_dataset = TensorDataset(X_train_fold, y_train_fold)
+            val_dataset = TensorDataset(X_val_fold, y_val_fold)
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=32)
+            
+            # Initialize model and training components
+            model = AttentionBiLSTM(input_size=input_size, hidden_size=64).to(device)
+            criterion_cls = nn.BCELoss()
+            criterion_reg = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
+            early_stopping = EarlyStopping(patience=10)
+            
+            # Train model
+            fold_history = train_model(
+                model, train_loader, val_loader,
+                criterion_cls, criterion_reg,
+                optimizer, scheduler,
+                early_stopping, device
+            )
+            
+            fold_metrics.append(fold_history)
         
         # Average metrics across folds
-        avg_metrics = {
-            k: np.mean([m[k] for m in fold_metrics])
-            for k in fold_metrics[0].keys()
-        }
+        avg_metrics = {}
+        for metric in ['val_loss', 'val_accuracy', 'val_precision', 'val_recall', 'val_f1']:
+            values = [m[metric][-1] for m in fold_metrics]  # Get final value for each fold
+            avg_metrics[metric] = sum(values) / len(values)
         
-        if not best_metrics or avg_metrics['val_acc'] > best_metrics['val_acc']:
+        logger.info(f"Average metrics for sequence length {seq_length}:")
+        for metric, value in avg_metrics.items():
+            logger.info(f"{metric}: {value:.4f}")
+        
+        # Update best metrics if validation loss improved
+        if avg_metrics['val_loss'] < best_val_loss:
+            best_val_loss = avg_metrics['val_loss']
             best_metrics = avg_metrics
             best_seq_length = seq_length
+            
+            # Update metrics history
+            if metrics_history is not None:
+                metrics_history.add_model_result(
+                    model_name=f"bilstm_seq{seq_length}",
+                    metrics=avg_metrics,
+                    hyperparameters={'sequence_length': seq_length}
+                )
+    
+    logger.info(f"Best sequence length: {best_seq_length}")
+    logger.info("Best metrics:")
+    for metric, value in best_metrics.items():
+        logger.info(f"{metric}: {value:.4f}")
     
     return best_metrics, best_seq_length
 
